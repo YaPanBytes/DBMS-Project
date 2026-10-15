@@ -1,4 +1,7 @@
-version: '3.8'
+# ConsentLedger
+#   docker compose up -d postgres            database only (run API/web locally)
+#   docker compose --profile app up -d --build   database + API + web app on http://localhost:8080
+#   docker compose --profile tools up -d     also pgAdmin on http://localhost:5050
 
 services:
   postgres:
@@ -7,28 +10,54 @@ services:
     environment:
       POSTGRES_DB: consentledger
       POSTGRES_USER: consentledger
-      POSTGRES_PASSWORD: consentledger
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-consentledger}
       POSTGRES_INITDB_ARGS: "--encoding=UTF-8 --locale=C"
     ports:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./database/migrations:/docker-entrypoint-initdb.d/migrations:ro
+    # Schema is applied with Alembic (python -m database.migrate), not init scripts.
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U consentledger -d consentledger"]
       interval: 5s
       timeout: 5s
-      retries: 5
-    networks:
-      - consentledger-net
+      retries: 10
 
-  # Optional: pgAdmin for database management
+  api:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: consentledger-api
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      DATABASE_URL: postgresql+psycopg://consentledger:${POSTGRES_PASSWORD:-consentledger}@postgres:5432/consentledger
+      FRONTEND_URL: http://localhost:8080
+      GOOGLE_REDIRECT_URI: http://localhost:8080/api/auth/google/callback
+      CORS_ORIGINS: http://localhost:8080
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    profiles: ["app"]
+
+  web:
+    build: ./frontend
+    container_name: consentledger-web
+    depends_on:
+      - api
+    ports:
+      - "8080:80"
+    profiles: ["app"]
+
   pgadmin:
     image: dpage/pgadmin4:8
     container_name: consentledger-pgadmin
     environment:
       PGADMIN_DEFAULT_EMAIL: admin@consentledger.local
-      PGADMIN_DEFAULT_PASSWORD: admin123
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD:-admin123}
       PGADMIN_CONFIG_SERVER_MODE: "False"
     ports:
       - "5050:80"
@@ -36,29 +65,8 @@ services:
       - pgadmin_data:/var/lib/pgadmin
     depends_on:
       - postgres
-    networks:
-      - consentledger-net
-    profiles:
-      - tools
-
-  # Optional: Redis for caching/sessions
-  redis:
-    image: redis:7-alpine
-    container_name: consentledger-redis
-    ports:
-      - "6379:6379"
-    volumes:
-      - redis_data:/data
-    networks:
-      - consentledger-net
-    profiles:
-      - cache
+    profiles: ["tools"]
 
 volumes:
   postgres_data:
   pgadmin_data:
-  redis_data:
-
-networks:
-  consentledger-net:
-    driver: bridge

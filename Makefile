@@ -1,82 +1,60 @@
-# ConsentLedger Makefile
-# Member A: Database Lead
+# ConsentLedger Makefile (run `make help`)
 
-.PHONY: help install dev-install test lint format migrate seed verify backup restore clean db-up db-down db-logs
+.PHONY: help install db-up db-down db-shell migrate migrate-status seed seed-clear api web dev \
+	test lint format verify verify-detailed tamper-test backup backup-list restore backup-verify \
+	detector logs docs app-up app-down clean setup
 
-# Default target
 help:
-	@echo "ConsentLedger - Database Commands"
-	@echo ""
-	@echo "Database:"
-	@echo "  db-up          Start PostgreSQL container"
-	@echo "  db-down        Stop PostgreSQL container"
-	@echo "  db-logs        View PostgreSQL logs"
-	@echo "  db-shell       Connect to PostgreSQL shell"
-	@echo ""
-	@echo "Migrations:"
-	@echo "  migrate        Run all pending migrations"
-	@echo "  migrate-status Show migration status"
-	@echo ""
-	@echo "Data:"
-	@echo "  seed           Seed database with demo data"
-	@echo "  seed-clear     Clear all data and re-seed"
-	@echo ""
-	@echo "Verification:"
-	@echo "  verify         Verify audit chain integrity"
-	@echo "  verify-detailed Detailed audit chain verification"
-	@echo "  tamper-test    Test tamper detection"
-	@echo ""
-	@echo "Backup/Restore:"
-	@echo "  backup         Create database backup"
-	@echo "  backup-list    List available backups"
-	@echo "  restore        Restore from backup"
-	@echo "  backup-verify  Verify backup integrity"
-	@echo ""
-	@echo "Testing:"
-	@echo "  test           Run database tests"
-	@echo "  test-cov       Run tests with coverage"
-	@echo ""
-	@echo "Code Quality:"
-	@echo "  lint           Run ruff linter"
-	@echo "  format         Format code with black"
-	@echo "  typecheck      Run mypy type checker"
-	@echo ""
-	@echo "Development:"
-	@echo "  install        Install production dependencies"
-	@echo "  dev-install    Install development dependencies"
-	@echo "  clean          Remove generated files"
+	@echo "Setup:      install, db-up, migrate, seed, setup (all of these)"
+	@echo "Run:        api (FastAPI :8000), web (Vite :5173), app-up / app-down (Docker, :8080)"
+	@echo "Database:   migrate-status, db-shell, seed-clear, db-down"
+	@echo "Audit:      verify, verify-detailed, tamper-test"
+	@echo "Backups:    backup, backup-list, restore FILE=..., backup-verify FILE=..."
+	@echo "AI:         logs (generate access logs), detector (run anomaly detection)"
+	@echo "Quality:    test, lint, format, docs"
 
-# Database
+install:
+	pip install -r requirements.txt
+	-python -m spacy download en_core_web_sm
+	cd frontend && npm install
+
 db-up:
-	docker-compose up -d postgres
-	@echo "Waiting for PostgreSQL to be ready..."
-	@sleep 3
-	@docker-compose exec postgres pg_isready -U consentledger -d consentledger
+	docker compose up -d postgres
+	@for i in $$(seq 1 30); do \
+		docker compose exec -T postgres pg_isready -U consentledger -d consentledger >/dev/null 2>&1 && exit 0; \
+		sleep 1; \
+	done; echo "PostgreSQL did not become ready in time"; exit 1
 
 db-down:
-	docker-compose down
-
-db-logs:
-	docker-compose logs -f postgres
+	docker compose down
 
 db-shell:
-	docker-compose exec postgres psql -U consentledger -d consentledger
+	docker compose exec postgres psql -U consentledger -d consentledger
 
-# Migrations
 migrate:
-	python -m database.migrate migrate
+	python -m database.migrate
 
 migrate-status:
 	python -m database.migrate status
 
-# Data
 seed:
 	python -m database.seeds.seed_data
 
 seed-clear:
 	python -m database.seeds.seed_data --clear
 
-# Verification
+api:
+	uvicorn backend.app.main:app --reload --port 8000
+
+web:
+	cd frontend && npm run dev
+
+app-up:
+	docker compose --profile app up -d --build
+
+app-down:
+	docker compose --profile app down
+
 verify:
 	python -m database.scripts.verify_audit
 
@@ -86,7 +64,6 @@ verify-detailed:
 tamper-test:
 	python -m database.scripts.verify_audit --tamper-test
 
-# Backup/Restore
 backup:
 	python -m database.scripts.backup_restore backup
 
@@ -94,48 +71,40 @@ backup-list:
 	python -m database.scripts.backup_restore backup --list
 
 restore:
-	@read -p "Backup file: " file; \
-	python -m database.scripts.backup_restore restore $$file
+	@test -n "$(FILE)" || (echo "Usage: make restore FILE=<backup file>"; exit 1)
+	python -m database.scripts.backup_restore restore $(FILE)
 
 backup-verify:
-	@read -p "Backup file: " file; \
-	python -m database.scripts.backup_restore verify $$file
+	@test -n "$(FILE)" || (echo "Usage: make backup-verify FILE=<backup file>"; exit 1)
+	python -m database.scripts.backup_restore verify $(FILE)
 
-# Testing
+logs:
+	python -m ai.log_generator --days 30
+
+detector:
+	python -m ai.anomaly
+
 test:
-	python -m pytest database/test_db.py -v
+	python -m pytest
+	cd frontend && npm run lint
 
-test-cov:
-	python -m pytest database/test_db.py --cov=database --cov-report=term-missing
-
-# Code Quality
 lint:
-	ruff check database/
+	ruff check database backend ai scripts conftest.py
+	black --check database backend ai scripts conftest.py
+	cd frontend && npm run lint
 
 format:
-	black database/
-	ruff check --fix database/
+	black database backend ai scripts conftest.py
+	ruff check --fix database backend ai scripts conftest.py
 
-typecheck:
-	mypy database/
+docs:
+	python scripts/export_openapi.py
+	python scripts/data_dictionary.py
 
-# Dependencies
-install:
-	pip install -r requirements.txt
-
-dev-install:
-	pip install -e ".[dev]"
-
-# Cleanup
 clean:
-	rm -rf __pycache__ .pytest_cache .mypy_cache .coverage htmlcov
-	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
-	find . -type f -name "*.pyc" -delete 2>/dev/null || true
+	rm -rf .pytest_cache .mypy_cache .ruff_cache .coverage htmlcov frontend/dist
+	find . -type d -name __pycache__ -prune -exec rm -rf {} + 2>/dev/null || true
 
-# Full setup
 setup: db-up migrate seed
 	@echo ""
-	@echo "✓ ConsentLedger database ready!"
-	@echo "  PostgreSQL: localhost:5432"
-	@echo "  Database: consentledger"
-	@echo "  User: consentledger / consentledger"
+	@echo "ConsentLedger is ready. Run 'make api' and 'make web', then open http://localhost:5173"
