@@ -1,186 +1,120 @@
 """
-ConsentLedger Migration Runner
-Member A: Database Lead
-Runs SQL migrations in order with transaction safety.
+ConsentLedger migration commands (thin wrapper around Alembic).
+
+    python -m database.migrate            # upgrade to the latest revision
+    python -m database.migrate status     # current revision and history
+    python -m database.migrate downgrade <revision|-1|base>
+
+Equivalent to running ``alembic upgrade head`` etc. from the project root.
 """
 
-import os
 import sys
 from pathlib import Path
-from sqlalchemy import create_engine, text, inspect
+
+from alembic import command
+from alembic.config import Config
+from alembic.runtime.migration import MigrationContext
+from alembic.script import ScriptDirectory
+from sqlalchemy import Engine, text
 from sqlalchemy.exc import OperationalError
 
-
-DATABASE_URL = os.getenv(
-    "DATABASE_URL",
-    "postgresql+psycopg://consentledger:consentledger@localhost:5432/consentledger"
-)
-
-MIGRATIONS_DIR = Path(__file__).parent / "migrations"
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+ALEMBIC_DIR = Path(__file__).resolve().parent / "alembic_env"
 
 
-def get_engine():
-    return create_engine(DATABASE_URL, future=True)
+def alembic_config(engine: Engine | None = None) -> Config:
+    ini = PROJECT_ROOT / "alembic.ini"
+    cfg = Config(str(ini)) if ini.exists() else Config()
+    cfg.set_main_option("script_location", str(ALEMBIC_DIR))
+    cfg.attributes["configure_logger"] = False
+    if engine is not None:
+        cfg.attributes["url"] = engine.url.render_as_string(hide_password=False)
+    return cfg
 
 
-def ensure_migrations_table(engine):
-    """Create migrations tracking table if it doesn't exist."""
-    with engine.connect() as conn:
-        conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS schema_migrations (
-                version VARCHAR(50) PRIMARY KEY,
-                name VARCHAR(255) NOT NULL,
-                applied_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-                checksum VARCHAR(64) NOT NULL
-            )
-        """))
-        conn.commit()
+def get_engine() -> Engine:
+    from database.connection import get_engine as _get_engine
+
+    return _get_engine()
 
 
-def get_applied_migrations(engine) -> set:
-    """Get set of already applied migration versions."""
-    with engine.connect() as conn:
-        result = conn.execute(text("SELECT version FROM schema_migrations"))
-        return {row[0] for row in result}
-
-
-def compute_checksum(content: str) -> str:
-    """Compute SHA256 checksum of migration content."""
-    import hashlib
-    return hashlib.sha256(content.encode()).hexdigest()
-
-
-def get_migration_files() -> list:
-    """Get sorted list of migration files."""
-    files = []
-    for f in sorted(MIGRATIONS_DIR.glob("*.sql")):
-        # Extract version from filename (e.g., 001_initial_schema.sql -> 001)
-        version = f.stem.split("_")[0]
-        files.append((version, f.stem, f))
-    return files
-
-
-def run_migration(engine, version: str, name: str, filepath: Path) -> bool:
-    """Run a single migration file."""
-    content = filepath.read_text()
-    checksum = compute_checksum(content)
-    
-    print(f"  Applying {version}: {name}...")
-    
+def _check_connection(engine: Engine) -> bool:
     try:
         with engine.connect() as conn:
-            # Run in transaction
-            trans = conn.begin()
-            try:
-                # Split by semicolon and execute each statement
-                statements = [s.strip() for s in content.split(";") if s.strip()]
-                for stmt in statements:
-                    if stmt:
-                        conn.execute(text(stmt))
-                
-                # Record migration
-                conn.execute(text("""
-                    INSERT INTO schema_migrations (version, name, checksum)
-                    VALUES (:version, :name, :checksum)
-                """), {"version": version, "name": name, "checksum": checksum})
-                
-                trans.commit()
-                print(f"  ✓ {version} applied successfully")
-                return True
-            except Exception as e:
-                trans.rollback()
-                print(f"  ✗ {version} failed: {e}")
-                return False
-    except Exception as e:
-        print(f"  ✗ {version} connection error: {e}")
+            conn.execute(text("SELECT 1"))
+        return True
+    except OperationalError as e:
+        print(f"Cannot connect to database: {e}")
         return False
 
 
-def migrate() -> int:
-    """Run all pending migrations."""
-    engine = get_engine()
-    
-    # Test connection
-    try:
-        with engine.connect() as conn:
-            conn.execute(text("SELECT 1"))
-    except OperationalError as e:
-        print(f"Cannot connect to database: {e}")
+def current_revision(engine: Engine) -> str | None:
+    with engine.connect() as conn:
+        return MigrationContext.configure(conn).get_current_revision()
+
+
+def head_revision() -> str | None:
+    return ScriptDirectory.from_config(alembic_config()).get_current_head()
+
+
+def migrate(engine: Engine | None = None) -> int:
+    """Upgrade the database to the latest Alembic revision."""
+    engine = engine or get_engine()
+    if not _check_connection(engine):
         return 1
-    
-    ensure_migrations_table(engine)
-    applied = get_applied_migrations(engine)
-    migrations = get_migration_files()
-    
-    print(f"Found {len(migrations)} migration(s)")
-    print(f"Already applied: {len(applied)}")
-    
-    pending = [(v, n, f) for v, n, f in migrations if v not in applied]
-    
-    if not pending:
-        print("No pending migrations.")
-        return 0
-    
-    print(f"Applying {len(pending)} pending migration(s)...")
-    
-    success = 0
-    for version, name, filepath in pending:
-        if run_migration(engine, version, name, filepath):
-            success += 1
-        else:
-            print(f"\nMigration {version} failed. Stopping.")
-            return 1
-    
-    print(f"\n✓ All {success} migration(s) applied successfully")
+    before = current_revision(engine)
+    try:
+        command.upgrade(alembic_config(engine), "head")
+    except Exception as e:
+        print(f"✗ Migration failed: {e}")
+        return 1
+    after = current_revision(engine)
+    if before == after:
+        print(f"No pending migrations (at {after}).")
+    else:
+        print(f"✓ Migrated {before or 'empty database'} -> {after}")
     return 0
 
 
-def status() -> int:
-    """Show migration status."""
-    engine = get_engine()
-    
-    try:
-        with engine.connect() as conn:
-            conn.execute(text("SELECT 1"))
-    except OperationalError as e:
-        print(f"Cannot connect to database: {e}")
+def status(engine: Engine | None = None) -> int:
+    engine = engine or get_engine()
+    if not _check_connection(engine):
         return 1
-    
-    ensure_migrations_table(engine)
-    applied = get_applied_migrations(engine)
-    migrations = get_migration_files()
-    
+    current = current_revision(engine)
+    script = ScriptDirectory.from_config(alembic_config())
     print("Migration Status:")
     print("-" * 60)
-    
-    for version, name, filepath in migrations:
-        status_mark = "✓" if version in applied else "○"
-        print(f"  {status_mark} {version}: {name}")
-    
+    applied = bool(current)
+    for rev in reversed(list(script.walk_revisions())):
+        mark = "✓" if applied else "○"
+        print(f"  {mark} {rev.revision}: {rev.doc}")
+        if rev.revision == current:
+            applied = False
     print("-" * 60)
-    print(f"Total: {len(migrations)}, Applied: {len(applied)}, Pending: {len(migrations) - len(applied)}")
+    print(f"Current: {current or 'none'}   Head: {script.get_current_head()}")
     return 0
 
 
-def rollback(version: str) -> int:
-    """Rollback a specific migration (if supported)."""
-    print(f"Rollback not implemented for {version}. Manual intervention required.")
+def downgrade(target: str, engine: Engine | None = None) -> int:
+    engine = engine or get_engine()
+    if not _check_connection(engine):
+        return 1
+    command.downgrade(alembic_config(engine), target)
+    print(f"✓ Downgraded to {current_revision(engine) or 'base'}")
+    return 0
+
+
+def main(argv: list[str]) -> int:
+    command_name = argv[1] if len(argv) > 1 else "migrate"
+    if command_name in ("migrate", "upgrade"):
+        return migrate()
+    if command_name == "status":
+        return status()
+    if command_name == "downgrade" and len(argv) > 2:
+        return downgrade(argv[2])
+    print("Usage: python -m database.migrate [migrate|status|downgrade <revision>]")
     return 1
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: python -m database.migrate [migrate|status|rollback <version>]")
-        sys.exit(1)
-    
-    command = sys.argv[1]
-    
-    if command == "migrate":
-        sys.exit(migrate())
-    elif command == "status":
-        sys.exit(status())
-    elif command == "rollback" and len(sys.argv) > 2:
-        sys.exit(rollback(sys.argv[2]))
-    else:
-        print(f"Unknown command: {command}")
-        sys.exit(1)
+    sys.exit(main(sys.argv))

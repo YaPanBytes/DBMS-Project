@@ -1,543 +1,182 @@
-# ConsentLedger Database Design Document
+# ConsentLedger Database Design
 
-**Member A: Database Lead**  
-**Version:** 1.0  
-**Date:** 2026-10-15
+PostgreSQL 16 is the single enforcement point: every client (the web app, the
+API, a script, a SQL console using the application role) gets the same consent
+rules, because they are implemented as row-level security, privileges, masked
+views and functions inside the database.
 
----
+- Entities, relationships, relational schema, 3NF: [`ER_DIAGRAM.md`](ER_DIAGRAM.md)
+- Every column: [`DATA_DICTIONARY.md`](DATA_DICTIONARY.md)
+- Example CRUD, joins, aggregates, window functions: [`../database/queries/demo_queries.sql`](../database/queries/demo_queries.sql)
 
-## 1. Introduction
+## 1. Migrations
 
-This document describes the database design for ConsentLedger, a PostgreSQL-backed data-sharing hub that enforces per-field, purpose-bound consent at the database level through Row-Level Security (RLS), masked views, and a hash-chained append-only audit log.
+The schema is written in SQL because it relies on features SQLAlchemy cannot
+express (policies, plpgsql functions, triggers, procedures). Alembic applies it:
 
-### 1.1 Design Goals
-- **Database-enforced consent**: No query path can bypass consent checks
-- **Instant revocation**: Revoked grants block access on next query
-- **Tamper-evident audit**: Hash-chained log detects any modification
-- **3NF normalization**: Eliminate redundancy, ensure data integrity
-- **Performance**: Indexes optimized for consent checks and audit queries
+| Revision | File | Contents |
+|---|---|---|
+| `0001` | `database/migrations/001_initial_schema.sql` | Tables, keys, constraints, indexes, `updated_at` triggers, append-only trigger, role rows |
+| `0002` | `database/migrations/002_rls_views_audit.sql` | RLS, hash chain, audit triggers, masked views, read path, procedures, feature views, application role |
+| `0003` | `database/migrations/003_auth_tokens.sql` | `revoked_tokens` for logout |
 
-### 1.2 Scope
-- Core schema (8 tables)
-- RLS policies (16 policies)
-- Triggers and stored procedures (7 functions/procedures)
-- Views for anomaly detection (2 views)
-- Audit chain verification
+Each revision has a matching downgrade in `database/migrations/down/`. Commands:
+`alembic upgrade head` or `python -m database.migrate` (also `status`,
+`downgrade <rev>`). The ORM models in `database/models` match the database
+exactly: `alembic revision --autogenerate` finds no differences.
 
----
+## 2. Request context and the application role
 
-## 2. Schema Overview
+At the start of every API request the backend runs, inside the request's transaction:
 
-### 2.1 Table Summary
-
-| Table | Purpose | Rows (Demo) |
-|-------|---------|-------------|
-| `organizations` | NGOs, agencies, funders, auditors | 6 |
-| `users` | People acting for organizations | ~18 |
-| `datasets` | Registered datasets | 6 |
-| `dataset_fields` | Fields/columns per dataset | ~45 |
-| `consent_grants` | Per-field, purpose-bound grants | ~15 |
-| `access_requests` | Partner requests for access | 2 |
-| `audit_log` | Append-only access records | ~500 |
-| `anomaly_alerts` | AI detector output | 3 |
-
-### 2.2 Extensions Required
 ```sql
-CREATE EXTENSION IF NOT EXISTS pgcrypto;      -- Encryption, hashing
-CREATE EXTENSION IF NOT EXISTS "uuid-ossp";   -- UUID generation
+SELECT set_config('consentledger.current_user_id', :user, true),
+       set_config('consentledger.current_org_id',  :org,  true),
+       set_config('consentledger.encryption_key',  :key,  true);
+SET LOCAL ROLE consentledger_app;
 ```
 
----
+`true` makes the settings transaction-local (the bind-parameter equivalent of
+`SET LOCAL`). RLS is bypassed by superusers and table owners, so requests switch
+to `consentledger_app`, which owns nothing. The backend re-applies the context at
+the start of every transaction a request opens (`backend/app/db.py`).
 
-## 3. Detailed Table Design
+Helpers: `current_user_id()`, `current_user_org_id()`, `current_user_role()`,
+`current_user_has_role(...)`, `current_purpose()`, `is_dataset_owner(ds)`.
 
-### 3.1 organizations
+## 3. Row-level security
+
+RLS is enabled on `datasets`, `dataset_fields`, `consent_grants`,
+`access_requests`, `audit_log` and `anomaly_alerts`.
+
+| Table | Who sees / changes what |
+|---|---|
+| datasets | Members of the owning org see their datasets; only the **owner role** inserts/updates; owners and partners see the catalogue of *published* datasets; auditors see all. No delete policy (archive instead). |
+| dataset_fields | Owners see and (owner role) edit their fields; field *descriptions* of published datasets are visible to partners so they know what to request; auditors see all. |
+| consent_grants | Grantor and grantee orgs see a grant; only the owner role of the dataset's org can insert or update; auditors see all. A trigger stops a grant's identity (who/what/purpose/when) from changing. |
+| access_requests | Requesting org and dataset owner see it; partners/owners create pending requests; owners decide; auditors see all. |
+| audit_log | Auditors see everything; an org sees its own users' actions and everything done to its datasets; the app may append events only for the session user. |
+| anomaly_alerts | Auditors, and owners of the dataset concerned. |
+
+The app role has no privileges on the per-dataset data tables, their masked
+views, or the feature views.
+
+## 4. Reading data: the masked, logged read path
+
+Publishing a dataset (`publish_dataset(ds)`, owner only) creates:
+
+- `data_<id>`: one column per field; encrypted fields hold `pgp_sym_encrypt` ciphertext;
+- `data_<id>_masked`: a `security_barrier` view. For every field:
+  `CASE WHEN can_see_field(ds, field) THEN value ELSE '[REDACTED]' (pii) / '[MASKED]' END`,
+  so non-consented values never leave the database, not even whether they are empty.
+
+`can_see_field` is true for the owning organization, or for a partner with an
+active, unexpired grant on that field **for the declared purpose**. One view
+serves every partner because it reads the session's organization and purpose.
+
+Partners read only through:
+
 ```sql
-CREATE TABLE organizations (
-    org_id          UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    name            VARCHAR(255) NOT NULL,
-    type            VARCHAR(50) NOT NULL CHECK (type IN ('ngo', 'government', 'funder', 'auditor')),
-    description     TEXT,
-    contact_email   VARCHAR(255),
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-```
-**Indexes:** `idx_organizations_type`
-
-### 3.2 users
-```sql
-CREATE TABLE users (
-    user_id         UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    org_id          UUID NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
-    email           VARCHAR(255) NOT NULL UNIQUE,
-    password_hash   VARCHAR(255) NOT NULL,
-    role            VARCHAR(50) NOT NULL CHECK (role IN ('owner', 'partner', 'auditor', 'admin')),
-    full_name       VARCHAR(255),
-    is_active       BOOLEAN NOT NULL DEFAULT true,
-    last_login      TIMESTAMPTZ,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-```
-**Indexes:** `idx_users_org_id`, `idx_users_email`
-
-### 3.3 datasets
-```sql
-CREATE TABLE datasets (
-    dataset_id      UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    owner_org_id    UUID NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
-    title           VARCHAR(255) NOT NULL,
-    description     TEXT,
-    category        VARCHAR(100),
-    status          VARCHAR(50) NOT NULL DEFAULT 'draft' CHECK (status IN ('draft', 'published', 'archived')),
-    version         INTEGER NOT NULL DEFAULT 1,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-```
-**Indexes:** `idx_datasets_owner_org_id`, `idx_datasets_status`
-
-### 3.4 dataset_fields
-```sql
-CREATE TABLE dataset_fields (
-    field_id        UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    dataset_id      UUID NOT NULL REFERENCES datasets(dataset_id) ON DELETE CASCADE,
-    name            VARCHAR(100) NOT NULL,
-    data_type       VARCHAR(50) NOT NULL CHECK (data_type IN ('text', 'integer', 'numeric', 'boolean', 'date', 'timestamp', 'json')),
-    sensitivity     VARCHAR(20) NOT NULL DEFAULT 'low' CHECK (sensitivity IN ('low', 'medium', 'high', 'pii')),
-    description     TEXT,
-    is_encrypted    BOOLEAN NOT NULL DEFAULT false,
-    ordinal         INTEGER NOT NULL DEFAULT 0,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    UNIQUE (dataset_id, name)
-);
-```
-**Indexes:** `idx_dataset_fields_dataset_id`
-
-### 3.5 consent_grants (Core Consent Model)
-```sql
-CREATE TABLE consent_grants (
-    grant_id        UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    grantor_org_id  UUID NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
-    grantee_org_id  UUID NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
-    dataset_id      UUID NOT NULL REFERENCES datasets(dataset_id) ON DELETE CASCADE,
-    field_id        UUID NOT NULL REFERENCES dataset_fields(field_id) ON DELETE CASCADE,
-    purpose         VARCHAR(500) NOT NULL,
-    expires_at      TIMESTAMPTZ NOT NULL,
-    revoked_at      TIMESTAMPTZ,
-    revoked_by      UUID REFERENCES users(user_id),
-    revocation_reason TEXT,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    UNIQUE (grantee_org_id, dataset_id, field_id, purpose),
-    CHECK (expires_at > created_at)
-);
-```
-**Indexes:**
-- `idx_consent_grants_grantee_dataset_expires` (grantee_org_id, dataset_id, expires_at) WHERE revoked_at IS NULL
-- `idx_consent_grants_grantor_dataset` (grantor_org_id, dataset_id)
-- `idx_consent_grants_field` (field_id)
-
-**Key Design Decisions:**
-- One row per (grantee, dataset, field, purpose) combination
-- `expires_at` enables automatic expiry
-- `revoked_at` enables instant revocation (RLS checks this)
-- `purpose` enables purpose-bound access
-- Partial index on active grants optimizes RLS checks
-
-### 3.6 access_requests
-```sql
-CREATE TABLE access_requests (
-    request_id      UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    grantee_org_id  UUID NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
-    dataset_id      UUID NOT NULL REFERENCES datasets(dataset_id) ON DELETE CASCADE,
-    field_ids       UUID[] NOT NULL DEFAULT '{}',
-    purpose         VARCHAR(500) NOT NULL,
-    requested_expires_at TIMESTAMPTZ NOT NULL,
-    status          VARCHAR(20) NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'denied', 'expired')),
-    decided_by      UUID REFERENCES users(user_id),
-    decided_at      TIMESTAMPTZ,
-    decision_note   TEXT,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-```
-**Indexes:** `idx_access_requests_grantee_status`, `idx_access_requests_dataset_status`
-
-### 3.7 audit_log (Append-Only, Hash-Chained)
-```sql
-CREATE TABLE audit_log (
-    log_id          UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    user_id         UUID NOT NULL REFERENCES users(user_id),
-    dataset_id      UUID REFERENCES datasets(dataset_id),
-    field_id        UUID REFERENCES dataset_fields(field_id),
-    action          VARCHAR(50) NOT NULL CHECK (action IN (...)),
-    rows_affected   INTEGER NOT NULL DEFAULT 0,
-    query_text      TEXT,
-    client_ip       INET,
-    user_agent      TEXT,
-    ts              TIMESTAMPTZ NOT NULL DEFAULT now(),
-    prev_hash       BYTEA NOT NULL,
-    row_hash        BYTEA NOT NULL,
-    CONSTRAINT audit_log_immutable CHECK (false) NO INHERIT
-);
-
-REVOKE UPDATE, DELETE ON audit_log FROM PUBLIC;
+SELECT access_dataset(dataset_id, purpose, limit, offset);  -- rows as JSON
 ```
 
-**Hash Chain Formula:**
-```
-row_hash = SHA256(prev_hash || user_id || dataset_id || action || ts)
-```
+It requires a purpose (for partners), refuses if there is no active grant for
+it, sets the purpose, reads the masked view, and **writes an audit entry** with
+the number of rows and the list of fields returned in clear text. Revoking a
+grant therefore takes effect on the very next call; there is nothing to cache.
 
-**Indexes:** `idx_audit_log_user_ts`, `idx_audit_log_dataset_ts`, `idx_audit_log_ts`
+Writes go through `ingest_dataset_rows(ds, rows_json)` (owner only), which
+encrypts flagged fields with the request's key. Statement-level triggers write
+one audit entry per write statement with the row count (never the values).
 
-### 3.8 anomaly_alerts
-```sql
-CREATE TABLE anomaly_alerts (
-    alert_id        UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    user_id         UUID NOT NULL REFERENCES users(user_id),
-    dataset_id      UUID REFERENCES datasets(dataset_id),
-    score           NUMERIC(5,4) NOT NULL CHECK (score >= 0 AND score <= 1),
-    reason          TEXT NOT NULL,
-    features        JSONB,
-    status          VARCHAR(20) NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'investigating', 'resolved', 'false_positive')),
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    resolved_at     TIMESTAMPTZ,
-    resolved_by     UUID REFERENCES users(user_id)
-);
-```
-**Indexes:** `idx_anomaly_alerts_user_status`, `idx_anomaly_alerts_dataset_status`
+## 5. Hash-chained, append-only audit log
 
----
+- `trg_audit_log_immutable` rejects `UPDATE`/`DELETE` for everyone (including the
+  owner); `UPDATE, DELETE, TRUNCATE` are revoked from PUBLIC.
+- `trg_audit_log_chain` (BEFORE INSERT) runs for *every* insert: it takes a
+  transaction-level advisory lock, assigns the next `seq`, and sets
+  `prev_hash` (previous row's hash; 32 zero bytes for the first) and
+  `row_hash = SHA-256(json_build_array(hex(prev_hash), user_id, dataset_id,
+  field_id, field_ids, action, rows_affected, query_text, client_ip, user_agent,
+  ts in UTC)::text)`. Client-supplied hashes are ignored. Ordering by `seq`
+  (not `ts`, which repeats within a transaction) keeps the chain well defined.
+- Business triggers record grants (`grant_create/update/revoke/expire`),
+  requests (`request_create/approve/deny`) and dataset changes. They run in the
+  same transaction as the change, so **a grant or revocation and its audit entry
+  commit or roll back together**.
+- `verify_chain()` walks the chain and returns the first row whose link or
+  content does not match; `is_audit_chain_valid()` wraps it. An independent
+  Python re-implementation lives in `database/scripts/verify_audit.py`
+  (`--detailed`), and `--tamper-test` demonstrates detection inside a rolled-back
+  transaction.
 
-## 4. Row-Level Security (RLS) Design
+## 6. Stored procedures
 
-### 4.1 Session Context Functions
-```sql
-current_user_org_id()  -- Returns UUID from session variable
-current_user_id()      -- Returns UUID from session variable
-```
+| Procedure | What it does |
+|---|---|
+| `request_access(user, dataset, field_ids, purpose, expires_at)` | Partner asks for fields of a published dataset; validates fields, purpose, expiry |
+| `approve_access_request(user, request, field_ids, purpose, expires_at, note)` | Owner approves, optionally narrowing fields/expiry; creates the grants atomically |
+| `deny_access_request(user, request, note)` | Owner denies |
+| `revoke_grant(user, grant, reason)` | Instant revocation |
+| `expire_grants()` | Scheduled job: expires old grants and stale requests |
 
-Application sets per-request:
-```sql
-SET LOCAL consentledger.current_user_id = '...';
-SET LOCAL consentledger.current_org_id = '...';
-```
+All are `SECURITY DEFINER` with a fixed `search_path`. `assert_actor()` checks
+that the acting user is the session user and has a permitted role, and the
+procedures record that user in the audit trail.
 
-### 4.2 RLS Policies (16 Total)
+## 7. Feature views for the anomaly detector (window functions)
 
-| Table | Policy Name | Target Role | Operation | Condition |
-|-------|-------------|-------------|-----------|-----------|
-| datasets | pol_datasets_owner_select | owner | SELECT | owner_org_id = current_org |
-| datasets | pol_datasets_owner_insert | owner | INSERT | owner_org_id = current_org |
-| datasets | pol_datasets_owner_update | owner | UPDATE | owner_org_id = current_org |
-| datasets | pol_datasets_partner_select | partner | SELECT | Has active grant on dataset |
-| datasets | pol_datasets_auditor_select | auditor | SELECT | user.role = 'auditor' |
-| dataset_fields | pol_fields_owner_select | owner | SELECT | Owner of dataset |
-| dataset_fields | pol_fields_partner_select | partner | SELECT | has_field_access() |
-| dataset_fields | pol_fields_auditor_select | auditor | SELECT | user.role = 'auditor' |
-| consent_grants | pol_grants_grantor_select | grantor | SELECT | grantor_org_id = current_org |
-| consent_grants | pol_grants_grantee_select | grantee | SELECT | grantee_org_id = current_org |
-| consent_grants | pol_grants_grantor_insert | grantor | INSERT | grantor_org_id = current_org |
-| consent_grants | pol_grants_grantor_revoke | grantor | UPDATE | grantor_org_id = current_org AND revoking |
-| consent_grants | pol_grants_auditor_select | auditor | SELECT | user.role = 'auditor' |
-| access_requests | pol_requests_grantee_select | grantee | SELECT | grantee_org_id = current_org |
-| access_requests | pol_requests_grantor_select | grantor | SELECT | Owner of dataset |
-| access_requests | pol_requests_grantee_insert | grantee | INSERT | grantee_org_id = current_org |
-| access_requests | pol_requests_grantor_update | grantor | UPDATE | Owner of dataset AND deciding |
-| access_requests | pol_requests_auditor_select | auditor | SELECT | user.role = 'auditor' |
+- `access_event_features`: per read, `ROW_NUMBER`, `LAG` (seconds since the
+  user's previous read), `COUNT`/`SUM` over a one-hour `RANGE` window, the user's
+  average rows and off-hours share, and `PERCENT_RANK` of the read size.
+- `access_features_hourly`: per user-hour, query/read/write counts, distinct
+  datasets and fields, rows per request, off-hours share, a rolling baseline over
+  the user's previous 24 active hours (`ROWS BETWEEN 24 PRECEDING AND 1
+  PRECEDING`), the ratio to that baseline, hours since previous activity, and the
+  hour's `RANK` across users.
+- `grant_usage_latency`: time from a grant to its first use (`ROW_NUMBER` per grant).
 
-### 4.3 Field-Level Access Function
-```sql
-has_field_access(grantee_org_id, dataset_id, field_id, purpose) 
-    RETURNS BOOLEAN
-```
-Checks: active grant exists for exact field + purpose, not revoked, not expired.
+Hours are computed in UTC; off-hours means outside 08:00-18:59 UTC.
 
----
+## 8. Field-level encryption
 
-## 5. Masked Views
+Fields flagged `is_encrypted` are stored with `pgp_sym_encrypt` (pgcrypto). The
+key is never stored in the database: the API passes `ENCRYPTION_KEY` per request
+in a transaction-local setting. `decrypt_field()` decrypts only inside the masked
+view, i.e. only for viewers allowed to see that field.
 
-### 5.1 Partner Dataset View
-```sql
-CREATE VIEW partner_dataset_view AS
-SELECT d.dataset_id, d.title, d.description, d.category,
-       cg.grant_id, cg.field_id, df.name AS field_name,
-       df.data_type, df.sensitivity, cg.purpose,
-       cg.expires_at, cg.revoked_at
-FROM datasets d
-JOIN consent_grants cg ON cg.dataset_id = d.dataset_id
-JOIN dataset_fields df ON df.field_id = cg.field_id
-WHERE cg.grantee_org_id = current_user_org_id()
-  AND cg.revoked_at IS NULL
-  AND cg.expires_at > now()
-  AND d.status = 'published';
-```
+## 9. Backup and restore
 
-### 5.2 Data Access (Dynamic)
-Each published dataset gets a data table `data_<dataset_id>` with RLS.
-Partners query through generated views that mask non-consented columns:
-- PII fields → `[REDACTED:type]`
-- High sensitivity → `[MASKED]`
-- Medium sensitivity → `XXXX` (regex replace)
-- Low sensitivity → actual value
+`database/scripts/backup_restore.py` wraps `pg_dump`/`pg_restore`:
 
----
-
-## 6. Triggers & Stored Procedures
-
-### 6.1 Updated_at Trigger (All Tables)
-```sql
-CREATE OR REPLACE FUNCTION update_updated_at_column()
-RETURNS TRIGGER LANGUAGE plpgsql AS $$
-BEGIN
-    NEW.updated_at = now();
-    RETURN NEW;
-END;
-$$;
-```
-
-### 6.2 Audit Log Trigger
-```sql
-CREATE OR REPLACE FUNCTION log_data_access()
-RETURNS TRIGGER LANGUAGE plpgsql SECURITY DEFINER AS $$
--- Computes hash chain, inserts into audit_log
-$$;
-```
-Attached to: consent_grants, access_requests, datasets, data_* tables
-
-### 6.3 Stored Procedures
-
-| Procedure | Purpose |
-|-----------|---------|
-| `request_access(user, dataset, field_ids, purpose, expires_at)` | Create access request with validation |
-| `approve_access_request(user, request_id, approved_fields, purpose, expires_at, note)` | Approve request, create grants atomically |
-| `revoke_grant(user, grant_id, reason)` | Instant revocation (sets revoked_at = now()) |
-| `expire_grants()` | Scheduled job: revoke expired grants |
-
----
-
-## 7. Audit Chain Verification
-
-### 7.1 Verification Function
-```sql
-CREATE OR REPLACE FUNCTION verify_audit_chain()
-RETURNS TABLE (log_id UUID, expected_hash BYTEA, actual_hash BYTEA, 
-               is_valid BOOLEAN, error_msg TEXT)
-```
-- Iterates audit_log in timestamp order
-- Verifies `prev_hash` matches previous `row_hash`
-- Recomputes `row_hash` from components
-- Returns first mismatch with details
-
-### 7.2 Quick Check
-```sql
-CREATE OR REPLACE FUNCTION is_audit_chain_valid()
-RETURNS BOOLEAN
-```
-Returns TRUE if entire chain valid.
-
-### 7.3 Tamper Detection
-Any modification to audit_log breaks the chain:
-- UPDATE row_hash → next row's prev_hash mismatch
-- DELETE row → next row's prev_hash mismatch
-- INSERT row → prev_hash mismatch with previous row
-
----
-
-## 8. Anomaly Detection Features
-
-### 8.1 access_features_hourly View
-```sql
-CREATE VIEW access_features_hourly AS
-SELECT user_id, date_trunc('hour', ts) AS hour_bucket,
-       COUNT(*) AS query_count,
-       COUNT(DISTINCT dataset_id) AS distinct_datasets,
-       COUNT(DISTINCT field_id) AS distinct_fields,
-       SUM(rows_affected) AS total_rows_read,
-       COUNT(*) FILTER (WHERE action = 'select') AS select_count,
-       COUNT(*) FILTER (WHERE action IN ('insert','update','delete')) AS write_count,
-       COUNT(*) FILTER (WHERE EXTRACT(hour FROM ts) NOT BETWEEN 8 AND 18) AS off_hours_count,
-       MAX(rows_affected) AS max_rows_per_query
-FROM audit_log
-WHERE action IN ('select', 'insert', 'update', 'delete')
-GROUP BY user_id, date_trunc('hour', ts);
-```
-
-### 8.2 grant_usage_latency View
-```sql
-CREATE VIEW grant_usage_latency AS
-SELECT cg.grant_id, cg.grantee_org_id, cg.dataset_id,
-       cg.created_at AS grant_time,
-       MIN(al.ts) AS first_access_time,
-       EXTRACT(EPOCH FROM (MIN(al.ts) - cg.created_at)) / 3600 AS hours_to_first_use
-FROM consent_grants cg
-LEFT JOIN audit_log al 
-    ON al.user_id IN (SELECT user_id FROM users WHERE org_id = cg.grantee_org_id)
-   AND al.dataset_id = cg.dataset_id
-   AND al.action = 'select'
-   AND al.ts >= cg.created_at
-WHERE cg.revoked_at IS NULL
-GROUP BY cg.grant_id, cg.grantee_org_id, cg.dataset_id, cg.created_at;
-```
-
----
-
-## 9. Field-Level Encryption
-
-### 9.1 pgcrypto Integration
-```sql
--- Encrypt on insert
-INSERT INTO data_xyz (ssn) VALUES (pgp_sym_encrypt('123-45-6789', 'key'));
-
--- Decrypt on select (owner only)
-SELECT pgp_sym_decrypt(ssn, 'key') FROM data_xyz;
-```
-
-### 9.2 Encryption Strategy
-- `dataset_fields.is_encrypted = true` marks columns for encryption
-- Encryption key managed by application (not stored in DB)
-- RLS ensures only authorized roles can decrypt
-
----
-
-## 10. Performance Considerations
-
-### 10.1 Critical Query: Consent Check (RLS)
-```sql
--- RLS policy uses this index
-SELECT 1 FROM consent_grants
-WHERE grantee_org_id = $1
-  AND dataset_id = $2
-  AND field_id = $3
-  AND revoked_at IS NULL
-  AND expires_at > now();
-```
-**Index:** `(grantee_org_id, dataset_id, expires_at) WHERE revoked_at IS NULL`
-
-### 10.2 Audit Log Queries
-- Time-range queries: `idx_audit_log_ts`
-- Per-user: `idx_audit_log_user_ts`
-- Per-dataset: `idx_audit_log_dataset_ts`
-
-### 10.3 Anomaly Detection
-- Hourly aggregation uses window functions
-- Materialized view refreshed periodically
-
----
-
-## 11. Backup & Restore Strategy
-
-### 11.1 Backup Types
-| Type | Tool | Use Case |
-|------|------|----------|
-| Full (custom) | `pg_dump -Fc` | Production backup |
-| Schema-only | `pg_dump -Fc --schema-only` | Migration testing |
-| Data-only | `pg_dump -Fc --data-only` | Data refresh |
-
-### 11.2 Restore Options
 ```bash
-# Full restore (clean)
-pg_restore -c -d consentledger backup.dump
-
-# Schema only
-pg_restore --schema-only -d consentledger backup.dump
-
-# Single transaction
-pg_restore --single-transaction -d consentledger backup.dump
+python -m database.scripts.backup_restore backup                 # custom format (.dump)
+python -m database.scripts.backup_restore backup --format plain  # .sql.gz
+python -m database.scripts.backup_restore backup --list
+python -m database.scripts.backup_restore verify <file>          # pg_restore --list / header check
+python -m database.scripts.backup_restore restore <file> [--clean]
 ```
 
-### 11.3 Verification
-- Metadata JSON with checksum
-- `verify_backup()` checks file integrity
-- Test restore to staging environment
+Data-only restores use `--disable-triggers` so restored rows don't generate new
+audit entries. The test suite includes a full round trip
+(`test_backup_and_restore_round_trip`): dump the seeded database, restore it into
+a fresh one, compare counts, verify the chain, and check new entries still chain.
 
----
+## 10. Seed data
 
-## 12. Migration Strategy
+`python -m database.seeds.seed_data` creates 6 organizations, 17 users, 7
+datasets (6 published with 60-120 rows each, PII columns encrypted), 49 fields,
+25 grants, 3 pending requests and ~1,400 access events from
+`ai/log_generator.py` (30 days, with injected bulk-export, off-hours and slow
+exfiltration patterns), then runs the anomaly detector.
 
-### 12.1 Migration Files
-```
-database/migrations/
-├── 001_initial_schema.sql      # Core tables, indexes, triggers
-├── 002_rls_views_audit.sql     # RLS policies, views, audit chain, procedures
-```
+## 11. Security checklist
 
-### 12.2 Migration Runner
-- Tracks applied migrations in `schema_migrations` table
-- Runs in transaction (rollback on failure)
-- Checksums prevent re-running modified migrations
-
----
-
-## 13. Seeding & Demo Data
-
-### 13.1 Seed Script
-`database/seeds/seed_data.py` creates:
-- 6 organizations (3 NGOs, 2 gov, 1 funder, 1 auditor)
-- 18 users (3 per org)
-- 6 datasets with 45 fields
-- 15 consent grants (active)
-- 2 access requests (pending)
-- 500+ audit log entries (with anomaly patterns)
-- 3 anomaly alerts
-
-### 13.2 Anomaly Patterns Injected
-- **Bulk export**: 5 queries >5000 rows in 20 minutes
-- **Off-hours**: 3 queries at 2:30 AM
-- **Immediate use**: Grant used 2 minutes after creation
-
----
-
-## 14. Security Checklist
-
-- [x] RLS enabled on all sensitive tables
-- [x] Policies cover all roles (owner, partner, auditor)
-- [x] Audit log immutable (UPDATE/DELETE revoked)
-- [x] Hash chain on audit log
-- [x] Field-level encryption for PII
-- [x] Password hashing (bcrypt)
-- [x] Session variables for RLS context
-- [x] Prepared statements in application (SQL injection prevention)
-- [x] Secrets in environment variables
-
----
-
-## 15. Future Enhancements
-
-1. **Column-level encryption** with per-field keys
-2. **Differential privacy** for aggregate queries
-3. **Federated queries** across PostgreSQL instances
-4. **Policy-as-code** for consent rules
-5. **Automated compliance reports** (GDPR, HIPAA)
-
----
-
-## Appendix: Quick Reference
-
-### Common Queries
-```sql
--- Active grants for org
-SELECT * FROM consent_grants 
-WHERE grantee_org_id = '...' AND revoked_at IS NULL AND expires_at > now();
-
--- Verify audit chain
-SELECT * FROM verify_audit_chain() WHERE is_valid = false;
-
--- Hourly access features
-SELECT * FROM access_features_hourly WHERE user_id = '...';
-
--- Grant latency
-SELECT * FROM grant_usage_latency WHERE hours_to_first_use < 1;
-```
-
-### Demo Credentials (from seed)
-| Role | Email | Password |
-|------|-------|----------|
-| Owner (Hope) | owner@hope.org | demo123 |
-| Partner (Health) | partner@health.gov | demo123 |
-| Funder | funder@globalfund.org | demo123 |
-| Auditor | auditor@transparency.org | demo123 |
+- [x] RLS on all consent-related tables, driven by per-request session settings
+- [x] API runs as a non-owner role; no direct access to data tables or feature views
+- [x] Purpose-bound reads; non-consented values masked inside the database
+- [x] Every read and write recorded in an append-only, hash-chained log
+- [x] Audit history protected by `RESTRICT` foreign keys and an immutability trigger
+- [x] Procedures check the acting user and role; `IS DISTINCT FROM` for authorization
+- [x] PII encrypted at rest with pgcrypto; key held outside the database
+- [x] Passwords hashed with bcrypt; secrets only in `.env`
