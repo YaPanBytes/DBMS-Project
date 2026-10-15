@@ -17,7 +17,7 @@ def normalize_header(name: str) -> str:
     if n[0].isdigit():
         n = f"col_{n}"
     return n[:63]
-//new parse function
+   # new parse function
 
 def parse_csv(raw: bytes) -> tuple[list[str], list[str], list[dict[str, str | None]]]:
     """Return (original headers, normalized names, rows keyed by normalized name)."""
