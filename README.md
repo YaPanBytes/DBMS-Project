@@ -87,7 +87,8 @@ password login is used.
 - **API:** JWT in an **httpOnly** cookie (`Secure` in production) with a
   double-submit CSRF token; bearer tokens for API clients; logout revokes the
   token server-side; roles come from the users/roles tables on every request
-  (`require_roles` dependency); bcrypt for passwords; Pydantic validation; every
+  (`require_roles` dependency); bcrypt for passwords; repeated failed logins
+  are throttled (429 with `Retry-After`); Pydantic validation; every
   error is `{"error": {"code", "message", "details"?}}`.
 - **Secrets** only in `.env` (database password, JWT secret, encryption key,
   OAuth client secret). Production refuses to start with development secrets.
@@ -99,9 +100,10 @@ python -m pytest                     # database, API and AI tests (creates and d
 cd frontend && npm run lint && npm run build
 ```
 
-The suite (91 tests) creates a throwaway `<db>_test` database, migrates and seeds
+The suite (109 tests) creates a throwaway `<db>_test` database, migrates and seeds
 it, and covers schema constraints, the audit chain and tamper detection,
-procedures, RLS and the masked read path, encryption, window features, a
+procedures, RLS and the masked read path (including that permission checks run
+once per query), encryption, window features, a
 `pg_dump`/`pg_restore` round trip, authentication (cookies, CSRF, bearer, logout,
 Google), RBAC, consent enforcement over HTTP, and the AI modules.
 

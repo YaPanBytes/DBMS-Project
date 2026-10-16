@@ -1,8 +1,9 @@
-import { useEffect, useState } from "react";
+import { Suspense, useEffect, useState } from "react";
 import { NavLink, Outlet, useLocation } from "react-router-dom";
 import type { Role } from "../api";
 import { useAuth } from "../auth";
 import { ROLE_LABELS } from "../format";
+import { Loading } from "./ui";
 
 export const NAV: { to: string; label: string; roles: Role[] }[] = [
   { to: "/", label: "Overview", roles: ["owner", "partner", "auditor", "admin"] },
@@ -65,7 +66,9 @@ export default function Layout() {
         </div>
       </aside>
       <main id="main" className="main" tabIndex={-1}>
-        <Outlet />
+        <Suspense fallback={<Loading />}>
+          <Outlet />
+        </Suspense>
       </main>
     </div>
   );

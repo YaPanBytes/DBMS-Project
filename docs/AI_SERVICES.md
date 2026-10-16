@@ -29,7 +29,10 @@ python -m ai.anomaly            # score, write alerts, print evaluation
 python -m ai.anomaly --dry-run  # evaluate only
 ```
 
-- **Input:** `access_features_hourly` (window-function features computed in SQL).
+- **Input:** `access_features_hourly` (window-function features computed in SQL),
+  joined to each user-hour's most-read dataset (one `DISTINCT ON` pass over the
+  log; this replaced a per-row subquery and cut feature loading from ~20 s to
+  ~0.3 s on 60k audit rows).
 - **Model:** scikit-learn `IsolationForest` (300 trees, contamination 1%) on
   log-scaled counts, off-hours share and the ratio to each user's rolling baseline.
 - **Baseline:** a threshold rule (any read ≥ 2,000 rows, ≥ 20,000 rows in an hour,
@@ -37,8 +40,10 @@ python -m ai.anomaly --dry-run  # evaluate only
 - **Output:** one `anomaly_alerts` row per flagged user-hour and detector with a
   0-1 score and a readable reason ("Read 228,144 rows in one hour, 3650x this
   user's typical hour; largest single read 11,808 rows"), plus an
-  `anomaly_alert` entry in the audit chain. Re-running is idempotent. Owners can
-  revoke the flagged organization's grants on the dataset in one click.
+  `anomaly_alert` entry in the audit chain. Re-running is idempotent. Auditors
+  and admins see every alert; owners see alerts on their datasets. Owners and
+  auditors triage them, and owners can revoke the flagged organization's grants
+  on the dataset in one click.
 
 **Evaluation on the seeded data** (user-hour level, 971 user-hours, 7 anomalous):
 

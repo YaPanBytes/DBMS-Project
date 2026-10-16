@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 
 from database.models import AuditAction, Organization, RevokedToken, User
 
-from .. import google_oauth
+from .. import google_oauth, ratelimit
 from ..config import get_settings
 from ..db import set_request_user
 from ..deps import AuthUser, DbSession
@@ -66,9 +66,12 @@ def auth_config() -> AuthConfigOut:
 def login(body: LoginIn, request: Request, response: Response, db: DbSession) -> MeOut:
     if not get_settings().allow_password_login:
         raise AppError(403, "Password login is disabled; sign in with Google")
+    ratelimit.check_login_allowed(request, body.email)
     user = _find_active_user(db, body.email)
     if not verify_password(body.password, user.password_hash if user else None):
+        ratelimit.record_login_failure(request, body.email)
         raise AppError(401, "Incorrect email or password", code="invalid_credentials")
+    ratelimit.record_login_success(request, body.email)
     token, expires = _complete_login(db, request, user, "password")
     set_session_cookies(response, token, expires)
     return _me(user, db.get(Organization, user.org_id), "cookie", expires)
@@ -84,9 +87,12 @@ def token(
 ) -> TokenOut:
     if not get_settings().allow_password_login:
         raise AppError(403, "Password login is disabled")
+    ratelimit.check_login_allowed(request, form.username)
     user = _find_active_user(db, form.username)
     if not verify_password(form.password, user.password_hash if user else None):
+        ratelimit.record_login_failure(request, form.username)
         raise AppError(401, "Incorrect email or password", code="invalid_credentials")
+    ratelimit.record_login_success(request, form.username)
     access_token, expires = _complete_login(db, request, user, "token")
     return TokenOut(access_token=access_token, expires_at=expires)
 

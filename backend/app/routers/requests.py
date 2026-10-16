@@ -139,8 +139,9 @@ def list_requests(
     summary="Request access to fields of a published dataset (stored procedure)",
 )
 def create_request(body: RequestCreate, db: DbSession, current: PartnerOrOwner) -> RequestOut:
-    db.execute(
-        text("CALL request_access(:u, :d, CAST(:f AS uuid[]), :p, :e)"),
+    # The procedure returns the new id through its INOUT parameter
+    request_id = db.execute(
+        text("CALL request_access(:u, :d, CAST(:f AS uuid[]), :p, :e, NULL)"),
         {
             "u": current.id,
             "d": body.dataset_id,
@@ -148,13 +149,7 @@ def create_request(body: RequestCreate, db: DbSession, current: PartnerOrOwner) 
             "p": body.purpose,
             "e": body.expires_at,
         },
-    )
-    request_id = db.scalar(
-        select(AccessRequest.request_id)
-        .where(AccessRequest.requested_by == current.id)
-        .order_by(AccessRequest.created_at.desc())
-        .limit(1)
-    )
+    ).scalar_one()
     db.commit()
     return _one(db, request_id)
 

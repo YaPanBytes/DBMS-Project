@@ -1,19 +1,21 @@
-import type { ReactNode } from "react";
+import { lazy, type ReactNode } from "react";
 import { Navigate, Route, Routes, useLocation } from "react-router-dom";
 import type { Role } from "./api";
 import { useAuth } from "./auth";
 import Layout from "./components/Layout";
 import { Loading } from "./components/ui";
-import AdminPage from "./pages/AdminPage";
-import AlertsPage from "./pages/AlertsPage";
-import AuditPage from "./pages/AuditPage";
-import ConsentsPage from "./pages/ConsentsPage";
-import DashboardPage from "./pages/DashboardPage";
-import DatasetPage from "./pages/DatasetPage";
-import DatasetsPage from "./pages/DatasetsPage";
 import LoginPage from "./pages/LoginPage";
-import NotFoundPage from "./pages/NotFoundPage";
-import RequestsPage from "./pages/RequestsPage";
+
+// Pages behind sign-in load on demand, so the login screen ships less code
+const AdminPage = lazy(() => import("./pages/AdminPage"));
+const AlertsPage = lazy(() => import("./pages/AlertsPage"));
+const AuditPage = lazy(() => import("./pages/AuditPage"));
+const ConsentsPage = lazy(() => import("./pages/ConsentsPage"));
+const DashboardPage = lazy(() => import("./pages/DashboardPage"));
+const DatasetPage = lazy(() => import("./pages/DatasetPage"));
+const DatasetsPage = lazy(() => import("./pages/DatasetsPage"));
+const NotFoundPage = lazy(() => import("./pages/NotFoundPage"));
+const RequestsPage = lazy(() => import("./pages/RequestsPage"));
 
 function RequireAuth({ children }: { children: ReactNode }) {
   const { me, loading } = useAuth();

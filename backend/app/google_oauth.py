@@ -63,13 +63,17 @@ def exchange_code(code: str) -> str:
 
 def verify_id_token(token: str, nonce: str | None = None) -> dict[str, Any]:
     """Verify a Google ID token and return its claims."""
+    from google.auth import exceptions as google_exceptions
     from google.auth.transport import requests as google_requests
     from google.oauth2 import id_token
 
     s = get_settings()
     try:
         claims = id_token.verify_oauth2_token(token, google_requests.Request(), s.google_client_id)
-    except ValueError as e:
+    except google_exceptions.TransportError as e:
+        # Fetching Google's signing keys failed (network)
+        raise GoogleAuthError("Could not reach Google") from e
+    except (ValueError, google_exceptions.GoogleAuthError) as e:
         raise GoogleAuthError("Invalid Google token") from e
     if claims.get("iss") not in ("accounts.google.com", "https://accounts.google.com"):
         raise GoogleAuthError("Invalid token issuer")

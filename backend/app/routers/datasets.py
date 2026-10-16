@@ -22,7 +22,7 @@ from database.models import (
     UserRole,
 )
 
-from ..csv_utils import parse_csv
+from ..csv_utils import MAX_UPLOAD_BYTES, parse_csv
 from ..deps import AuthUser, CurrentUser, DbSession, OwnerUser, Paging
 from ..errors import AppError
 from ..schemas import (
@@ -231,6 +231,20 @@ def _check_editable(ds: Dataset) -> None:
         raise AppError(400, "Archived datasets cannot be changed")
 
 
+def _refresh_if_published(db: Session, ds: Dataset) -> None:
+    """Field changes on a published dataset must reach its data table (new
+    columns) and masked view (new columns, mask labels, order)."""
+    if ds.status == DatasetStatus.PUBLISHED:
+        db.flush()
+        db.execute(text("SELECT publish_dataset(:d)"), {"d": ds.dataset_id})
+
+
+async def _read_upload(file: UploadFile) -> bytes:
+    # Read one byte past the limit so oversized files are rejected without
+    # loading them whole
+    return await file.read(MAX_UPLOAD_BYTES + 1)
+
+
 @router.post("/{dataset_id}/fields", response_model=FieldOut, status_code=201)
 def add_field(
     dataset_id: UUID, body: FieldCreate, db: DbSession, current: OwnerUser
@@ -242,6 +256,7 @@ def add_field(
         data["ordinal"] = _next_ordinal(db, dataset_id)
     field = DatasetField(dataset_id=dataset_id, **data)
     db.add(field)
+    _refresh_if_published(db, ds)
     db.commit()
     return field
 
@@ -268,6 +283,7 @@ def add_fields(
         field = DatasetField(dataset_id=dataset_id, **data)
         db.add(field)
         created.append(field)
+    _refresh_if_published(db, ds)
     db.commit()
     return created
 
@@ -290,6 +306,7 @@ def update_field(
         raise AppError(400, "Encryption cannot be changed after the dataset is published")
     for k, v in data.items():
         setattr(field, k, v)
+    _refresh_if_published(db, ds)
     db.commit()
     db.refresh(field)
     return field
@@ -323,7 +340,7 @@ async def upload_preview(
     file: Annotated[UploadFile, File(description="UTF-8 CSV file")],
 ) -> UploadPreview:
     _owned_dataset(db, dataset_id, current)
-    headers, names, rows = parse_csv(await file.read())
+    headers, names, rows = parse_csv(await _read_upload(file))
     report = scan_rows(rows)
     by_name = {f.name: f for f in report.fields}
     columns = []
@@ -386,7 +403,7 @@ async def upload_rows(
     ds = _owned_dataset(db, dataset_id, current)
     if ds.status != DatasetStatus.PUBLISHED:
         raise AppError(400, "Publish the dataset before loading data")
-    _, names, rows = parse_csv(await file.read())
+    _, names, rows = parse_csv(await _read_upload(file))
     known = set(db.scalars(select(DatasetField.name).where(DatasetField.dataset_id == dataset_id)))
     if not known & set(names):
         raise AppError(422, "None of the CSV columns match the dataset's fields")

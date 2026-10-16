@@ -16,7 +16,7 @@ from database.models import (
     User,
 )
 
-from ..deps import AuditorOrAdmin, AuthUser, DbSession, OwnerUser, Paging
+from ..deps import AuditorOrAdmin, AuthUser, DbSession, OwnerOrAuditor, OwnerUser, Paging
 from ..errors import AppError
 from ..schemas import AlertOut, AlertRevokeResult, AlertUpdate, DetectorRunOut, Page, make_page
 from ..services import count, now
@@ -69,7 +69,9 @@ def alert_out(row) -> AlertOut:
 
 
 @router.get(
-    "", response_model=Page[AlertOut], summary="Alerts on your datasets (auditors: all alerts)"
+    "",
+    response_model=Page[AlertOut],
+    summary="Alerts on your datasets (auditors and admins: all alerts)",
 )
 def list_alerts(
     db: DbSession,
@@ -115,7 +117,9 @@ def get_alert(alert_id: UUID, db: DbSession, current: AuthUser) -> AlertOut:
 
 
 @router.patch("/{alert_id}", response_model=AlertOut, summary="Change status (investigate/resolve)")
-def update_alert(alert_id: UUID, body: AlertUpdate, db: DbSession, current: AuthUser) -> AlertOut:
+def update_alert(
+    alert_id: UUID, body: AlertUpdate, db: DbSession, current: OwnerOrAuditor
+) -> AlertOut:
     alert = db.get(AnomalyAlert, alert_id)
     if alert is None:
         raise AppError(404, "Alert not found")
