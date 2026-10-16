@@ -7,7 +7,7 @@ from uuid import UUID
 from fastapi import APIRouter, Query
 from sqlalchemy import or_, select
 
-from database.models import Organization, OrgType, Role, User, UserRole
+from database.models import ROLE_IDS, Organization, OrgType, Role, User, UserRole
 
 from ..deps import AdminUser, AuthUser, DbSession, Paging
 from ..errors import AppError
@@ -105,9 +105,7 @@ def list_users(
         like = f"%{q}%"
         stmt = stmt.where(or_(User.email.ilike(like), User.full_name.ilike(like)))
     if role:
-        stmt = stmt.where(
-            User.role_id == select(Role.role_id).where(Role.name == role.value).scalar_subquery()
-        )
+        stmt = stmt.where(User.role_id == ROLE_IDS[role])
     if is_active is not None:
         stmt = stmt.where(User.is_active == is_active)
     total = count(db, stmt)

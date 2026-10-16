@@ -1875,6 +1875,52 @@
         }
       }
     },
+    "/api/consents/revoke": {
+      "post": {
+        "tags": [
+          "consent"
+        ],
+        "summary": "Revoke several grants at once (all or nothing; already revoked ones are skipped)",
+        "operationId": "revoke_many_api_consents_revoke_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BulkRevokeIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BulkRevokeOut"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "OAuth2PasswordBearer": []
+          }
+        ]
+      }
+    },
     "/api/consents/{grant_id}": {
       "get": {
         "tags": [
@@ -2550,7 +2596,7 @@
         "tags": [
           "audit"
         ],
-        "summary": "Verify the whole hash chain with verify_chain()",
+        "summary": "Verify the whole hash chain with verify_chain_summary()",
         "operationId": "verify_api_audit_verify_get",
         "responses": {
           "200": {
@@ -2631,7 +2677,7 @@
         "tags": [
           "alerts"
         ],
-        "summary": "Alerts on your datasets (auditors: all alerts)",
+        "summary": "Alerts on your datasets (auditors and admins: all alerts)",
         "operationId": "list_alerts_api_alerts_get",
         "security": [
           {
@@ -3500,6 +3546,50 @@
           "fields"
         ],
         "title": "BulkFieldsIn"
+      },
+      "BulkRevokeIn": {
+        "properties": {
+          "grant_ids": {
+            "items": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "type": "array",
+            "maxItems": 500,
+            "minItems": 1,
+            "title": "Grant Ids"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 1000
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          }
+        },
+        "type": "object",
+        "required": [
+          "grant_ids"
+        ],
+        "title": "BulkRevokeIn"
+      },
+      "BulkRevokeOut": {
+        "properties": {
+          "revoked": {
+            "type": "integer",
+            "title": "Revoked"
+          }
+        },
+        "type": "object",
+        "required": [
+          "revoked"
+        ],
+        "title": "BulkRevokeOut"
       },
       "ChainError": {
         "properties": {

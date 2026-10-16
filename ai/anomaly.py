@@ -60,18 +60,22 @@ MODEL_PATH = Path(__file__).resolve().parent / "models" / "isolation_forest.jobl
 DEFAULT_LABELS = Path(__file__).resolve().parent / "data" / "labels.csv"
 
 FEATURE_SQL = """
-SELECT f.*,
-       u.org_id,
-       (SELECT a.dataset_id
-          FROM audit_log a
-         WHERE a.user_id = f.user_id
-           AND a.action = 'select'
-           AND date_trunc('hour', a.ts AT TIME ZONE 'UTC') = f.hour_bucket
-         GROUP BY a.dataset_id
-         ORDER BY sum(a.rows_affected) DESC
-         LIMIT 1) AS top_dataset_id
+WITH dataset_hours AS (
+    -- Dataset most read by each user in each hour (one pass over the log)
+    SELECT DISTINCT ON (a.user_id, date_trunc('hour', a.ts AT TIME ZONE 'UTC'))
+           a.user_id,
+           date_trunc('hour', a.ts AT TIME ZONE 'UTC') AS hour_bucket,
+           a.dataset_id AS top_dataset_id
+    FROM audit_log a
+    WHERE a.action = 'select' AND a.user_id IS NOT NULL
+    GROUP BY a.user_id, date_trunc('hour', a.ts AT TIME ZONE 'UTC'), a.dataset_id
+    ORDER BY a.user_id, date_trunc('hour', a.ts AT TIME ZONE 'UTC'),
+             sum(a.rows_affected) DESC NULLS LAST, a.dataset_id
+)
+SELECT f.*, u.org_id, dh.top_dataset_id
 FROM access_features_hourly f
 JOIN users u ON u.user_id = f.user_id
+LEFT JOIN dataset_hours dh ON dh.user_id = f.user_id AND dh.hour_bucket = f.hour_bucket
 WHERE f.select_count > 0
 ORDER BY f.user_id, f.hour_bucket
 """

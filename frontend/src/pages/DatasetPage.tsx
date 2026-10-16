@@ -330,10 +330,12 @@ function SharingTab({ d, isOwner }: { d: DatasetDetail; isOwner: boolean }) {
   }, [grants.data]);
 
   const revokeAll = async (list: Consent[]) => {
-    const ok = await run(async () => {
-      for (const g of list) await api.post(`/consents/${g.grant_id}/revoke`, { reason: "Revoked from dataset page" });
-      return true;
-    });
+    const ok = await run(() =>
+      api.post<{ revoked: number }>("/consents/revoke", {
+        grant_ids: list.map((g) => g.grant_id),
+        reason: "Revoked from dataset page",
+      }),
+    );
     if (ok) {
       toast(`Revoked ${list.length} field grants. ${list[0].grantee_org_name}'s next read is already blocked.`);
       grants.reload();

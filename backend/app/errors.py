@@ -7,7 +7,8 @@ from typing import Any
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from sqlalchemy.exc import DBAPIError, IntegrityError, NoResultFound
+from sqlalchemy.exc import DBAPIError, IntegrityError, NoResultFound, OperationalError
+from sqlalchemy.orm.exc import StaleDataError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 log = logging.getLogger("consentledger.api")
@@ -22,12 +23,20 @@ HTTP_CODES = {
     422: "validation_error",
     429: "too_many_requests",
     500: "internal_error",
+    503: "service_unavailable",
 }
 
 
 class AppError(Exception):
-    def __init__(self, status: int, message: str, code: str | None = None, details: Any = None):
-        self.status, self.message, self.details = status, message, details
+    def __init__(
+        self,
+        status: int,
+        message: str,
+        code: str | None = None,
+        details: Any = None,
+        headers: dict[str, str] | None = None,
+    ):
+        self.status, self.message, self.details, self.headers = status, message, details, headers
         self.code = code or HTTP_CODES.get(status, "error")
         super().__init__(message)
 
@@ -62,13 +71,23 @@ def _db_error(exc: DBAPIError) -> tuple[int, str, str]:
         return 422, "constraint_violation", f"Value rejected by a database rule: {primary}"
     if sqlstate in ("22P02", "22007", "22008", "22003"):
         return 422, "invalid_value", primary
+    if sqlstate in ("40001", "40P01"):  # serialization failure, deadlock
+        return 409, "conflict", "The record was changed at the same time; please try again"
+    if sqlstate == "57014":  # statement timeout / cancelled
+        return 503, "service_unavailable", "The database took too long to answer; please try again"
+    if isinstance(exc, OperationalError) and not sqlstate:
+        return 503, "service_unavailable", "The database is unavailable; please try again shortly"
     return 500, "database_error", "A database error occurred"
 
 
 def install_exception_handlers(app: FastAPI) -> None:
     @app.exception_handler(AppError)
     async def _app_error(_: Request, exc: AppError) -> JSONResponse:
-        return JSONResponse(error_body(exc.code, exc.message, exc.details), status_code=exc.status)
+        return JSONResponse(
+            error_body(exc.code, exc.message, exc.details),
+            status_code=exc.status,
+            headers=exc.headers,
+        )
 
     @app.exception_handler(StarletteHTTPException)
     async def _http_error(_: Request, exc: StarletteHTTPException) -> JSONResponse:
@@ -98,6 +117,14 @@ def install_exception_handlers(app: FastAPI) -> None:
     @app.exception_handler(NoResultFound)
     async def _not_found(_: Request, __: NoResultFound) -> JSONResponse:
         return JSONResponse(error_body("not_found", "Record not found"), status_code=404)
+
+    @app.exception_handler(StaleDataError)
+    async def _stale(_: Request, __: StaleDataError) -> JSONResponse:
+        # An UPDATE matched no row: under RLS that means the row is not writable
+        return JSONResponse(
+            error_body("forbidden", "You are not allowed to perform this action on that record"),
+            status_code=403,
+        )
 
     @app.exception_handler(IntegrityError)
     @app.exception_handler(DBAPIError)

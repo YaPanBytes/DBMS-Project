@@ -304,6 +304,15 @@ class RevokeIn(BaseModel):
     reason: str | None = Field(None, max_length=1000)
 
 
+class BulkRevokeIn(BaseModel):
+    grant_ids: Annotated[list[UUID], Field(min_length=1, max_length=500)]
+    reason: str | None = Field(None, max_length=1000)
+
+
+class BulkRevokeOut(BaseModel):
+    revoked: int
+
+
 class ExtendIn(BaseModel):
     expires_at: datetime
 

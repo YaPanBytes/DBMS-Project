@@ -85,19 +85,22 @@ def list_audit(
 
 
 @router.get(
-    "/verify", response_model=VerifyOut, summary="Verify the whole hash chain with verify_chain()"
+    "/verify",
+    response_model=VerifyOut,
+    summary="Verify the whole hash chain with verify_chain_summary()",
 )
 def verify(db: DbSession, current: AuthUser) -> VerifyOut:
     if current.role == UserRole.PARTNER:
         raise AppError(403, "Only owners, auditors and admins can verify the chain")
-    # verify_chain() walks every row (SECURITY DEFINER) and stops at the first break
-    rows = db.execute(text("SELECT log_id, is_valid, error_msg FROM verify_chain()")).all()
-    bad = next((r for r in rows if not r.is_valid), None)
+    # Walks every row (SECURITY DEFINER), stops at the first break, returns one row
+    r = db.execute(text("SELECT * FROM verify_chain_summary()")).one()
     return VerifyOut(
-        valid=bad is None,
-        total_rows=len(rows),
-        verified_rows=sum(1 for r in rows if r.is_valid),
-        first_error=ChainError(log_id=bad.log_id, message=bad.error_msg) if bad else None,
+        valid=r.is_valid,
+        total_rows=r.total_rows,
+        verified_rows=r.verified_rows,
+        first_error=(
+            None if r.is_valid else ChainError(log_id=r.first_bad_log_id, message=r.error_msg)
+        ),
         checked_at=now(),
     )
 

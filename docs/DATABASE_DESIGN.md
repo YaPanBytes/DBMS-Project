@@ -19,6 +19,7 @@ express (policies, plpgsql functions, triggers, procedures). Alembic applies it:
 | `0001` | `database/migrations/001_initial_schema.sql` | Tables, keys, constraints, indexes, `updated_at` triggers, append-only trigger, role rows |
 | `0002` | `database/migrations/002_rls_views_audit.sql` | RLS, hash chain, audit triggers, masked views, read path, procedures, feature views, application role |
 | `0003` | `database/migrations/003_auth_tokens.sql` | `revoked_tokens` for logout |
+| `0004` | `database/migrations/004_performance_and_fixes.sql` | Faster policies and read path (same rules), salted AES-256 encryption, `verify_chain_summary()`, `request_access` returns the new id, admins can read alerts and dataset metadata |
 
 Each revision has a matching downgrade in `database/migrations/down/`. Commands:
 `alembic upgrade head` or `python -m database.migrate` (also `status`,
@@ -51,15 +52,21 @@ RLS is enabled on `datasets`, `dataset_fields`, `consent_grants`,
 
 | Table | Who sees / changes what |
 |---|---|
-| datasets | Members of the owning org see their datasets; only the **owner role** inserts/updates; owners and partners see the catalogue of *published* datasets; auditors see all. No delete policy (archive instead). |
+| datasets | Members of the owning org see their datasets; only the **owner role** inserts/updates; owners and partners see the catalogue of *published* datasets; auditors and admins see all (metadata only). No delete policy (archive instead). |
 | dataset_fields | Owners see and (owner role) edit their fields; field *descriptions* of published datasets are visible to partners so they know what to request; auditors see all. |
 | consent_grants | Grantor and grantee orgs see a grant; only the owner role of the dataset's org can insert or update; auditors see all. A trigger stops a grant's identity (who/what/purpose/when) from changing. |
 | access_requests | Requesting org and dataset owner see it; partners/owners create pending requests; owners decide; auditors see all. |
 | audit_log | Auditors see everything; an org sees its own users' actions and everything done to its datasets; the app may append events only for the session user. |
-| anomaly_alerts | Auditors, and owners of the dataset concerned. |
+| anomaly_alerts | Auditors and admins see all; owners see (and with auditors, triage) alerts on their datasets. |
 
 The app role has no privileges on the per-dataset data tables, their masked
 views, or the feature views.
+
+Policies wrap their helper calls in scalar subqueries, e.g.
+`owner_org_id = (SELECT current_user_org_id())` and
+`dataset_id = ANY ((SELECT current_org_dataset_ids())::uuid[])`. An uncorrelated
+subquery becomes an InitPlan, so each helper runs once per query rather than
+once per row (counting 60k audit rows as an owner went from ~400 ms to ~15 ms).
 
 ## 4. Reading data: the masked, logged read path
 
@@ -67,8 +74,9 @@ Publishing a dataset (`publish_dataset(ds)`, owner only) creates:
 
 - `data_<id>`: one column per field; encrypted fields hold `pgp_sym_encrypt` ciphertext;
 - `data_<id>_masked`: a `security_barrier` view. For every field:
-  `CASE WHEN can_see_field(ds, field) THEN value ELSE '[REDACTED]' (pii) / '[MASKED]' END`,
+  `CASE WHEN (SELECT can_see_field(ds, field)) THEN value ELSE '[REDACTED]' (pii) / '[MASKED]' END`,
   so non-consented values never leave the database, not even whether they are empty.
+  Each check is an InitPlan, evaluated once per query.
 
 `can_see_field` is true for the owning organization, or for a partner with an
 active, unexpired grant on that field **for the declared purpose**. One view
@@ -81,9 +89,18 @@ SELECT access_dataset(dataset_id, purpose, limit, offset);  -- rows as JSON
 ```
 
 It requires a purpose (for partners), refuses if there is no active grant for
-it, sets the purpose, reads the masked view, and **writes an audit entry** with
-the number of rows and the list of fields returned in clear text. Revoking a
-grant therefore takes effect on the very next call; there is nothing to cache.
+it, and works out once which fields the caller may see. It then takes the
+requested page from the data table (`ORDER BY row_id LIMIT/OFFSET`) and builds
+each output column as either the value (decrypted if needed) or a constant
+mask, so only the returned rows are ever decrypted. It applies exactly the
+rules of the masked view, and **writes an audit entry** with the number of
+rows and the list of fields returned in clear text. Revoking a grant therefore
+takes effect on the very next call; there is nothing to cache.
+
+Before 0004 the function read the masked view, which evaluated every cell of
+every row before `LIMIT`; a 100-row page of a 20k-row dataset took 3.6 s for a
+partner and 9.5 s for an owner (decryption). It now takes under 10 ms and about
+140 ms (or ~6 ms with ciphertext written since 0004).
 
 Writes go through `ingest_dataset_rows(ds, rows_json)` (owner only), which
 encrypts flagged fields with the request's key. Statement-level triggers write
@@ -104,8 +121,11 @@ one audit entry per write statement with the row count (never the values).
   requests (`request_create/approve/deny`) and dataset changes. They run in the
   same transaction as the change, so **a grant or revocation and its audit entry
   commit or roll back together**.
-- `verify_chain()` walks the chain and returns the first row whose link or
-  content does not match; `is_audit_chain_valid()` wraps it. An independent
+- `verify_chain()` walks the chain in `seq` order, returning one row per entry
+  up to the first whose link or content does not match.
+  `verify_chain_summary()` does the same walk and returns a single row
+  (`is_valid, total_rows, verified_rows, first_bad_log_id, error_msg`); the API
+  and `is_audit_chain_valid()` use it. An independent
   Python re-implementation lives in `database/scripts/verify_audit.py`
   (`--detailed`), and `--tamper-test` demonstrates detection inside a rolled-back
   transaction.
@@ -114,7 +134,7 @@ one audit entry per write statement with the row count (never the values).
 
 | Procedure | What it does |
 |---|---|
-| `request_access(user, dataset, field_ids, purpose, expires_at)` | Partner asks for fields of a published dataset; validates fields, purpose, expiry |
+| `request_access(user, dataset, field_ids, purpose, expires_at, INOUT request_id)` | Partner asks for fields of a published dataset; validates fields, purpose, expiry; returns the new request id |
 | `approve_access_request(user, request, field_ids, purpose, expires_at, note)` | Owner approves, optionally narrowing fields/expiry; creates the grants atomically |
 | `deny_access_request(user, request, note)` | Owner denies |
 | `revoke_grant(user, grant, reason)` | Instant revocation |
@@ -140,10 +160,13 @@ Hours are computed in UTC; off-hours means outside 08:00-18:59 UTC.
 
 ## 8. Field-level encryption
 
-Fields flagged `is_encrypted` are stored with `pgp_sym_encrypt` (pgcrypto). The
+Fields flagged `is_encrypted` are stored with `pgp_sym_encrypt` (pgcrypto),
+using AES-256 with a salted S2K (`cipher-algo=aes256, s2k-mode=1`). The key is a
+long random secret, so pgcrypto's default iterated key stretching only added
+about 1 ms per value; ciphertext written before 0004 still decrypts. The
 key is never stored in the database: the API passes `ENCRYPTION_KEY` per request
-in a transaction-local setting. `decrypt_field()` decrypts only inside the masked
-view, i.e. only for viewers allowed to see that field.
+in a transaction-local setting. `decrypt_field()` is only called for fields the
+viewer may see (in `access_dataset` and the masked view).
 
 ## 9. Backup and restore
 

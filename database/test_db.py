@@ -798,6 +798,124 @@ class TestEnforcement:
 # ============================================================================
 
 
+class TestReviewFixes:
+    """Migration 0004: cheaper reads with the same rules, and small fixes."""
+
+    def test_new_ciphertext_is_salted_aes256(self, conn: Connection, world: dict) -> None:
+        publish_with_rows(conn, world, ROWS)
+        table = conn.execute(
+            text("SELECT dataset_data_table_name(:d)"), {"d": world["dataset"].id}
+        ).scalar()
+        raw = conn.execute(text(f"SELECT full_name FROM {table} LIMIT 1")).scalar()
+        assert raw[2:5] == b"\x04\x09\x01"  # OpenPGP v4, AES-256, salted S2K
+
+    def test_old_ciphertext_still_decrypts(self, conn: Connection, world: dict) -> None:
+        publish_with_rows(conn, world, ROWS)
+        table = conn.execute(
+            text("SELECT dataset_data_table_name(:d)"), {"d": world["dataset"].id}
+        ).scalar()
+        conn.execute(
+            text(f"UPDATE {table} SET full_name = pgp_sym_encrypt('Old Style', :k)"),
+            {"k": ENC_KEY},
+        )
+        act_as(conn, world["owner"])
+        rows = list(conn.execute(text("SELECT access_dataset(:d)"), {"d": world["dataset"].id}))
+        assert rows[0][0]["full_name"] == "Old Style"
+
+    def test_paging_reads_only_the_page(self, db: Session, conn: Connection, world: dict) -> None:
+        publish_with_rows(conn, world, ROWS)
+        act_as(conn, world["owner"])
+        rows = conn.execute(
+            text("SELECT access_dataset(:d, NULL, 1, 1)"), {"d": world["dataset"].id}
+        ).scalars()
+        assert [r["full_name"] for r in rows] == ["Ravi Kumar"]
+
+    def test_masked_view_still_enforces_consent(
+        self, db: Session, conn: Connection, world: dict
+    ) -> None:
+        db.add(grant(world, "income", "analytics"))
+        db.flush()
+        publish_with_rows(conn, world, ROWS)
+        view = conn.execute(
+            text("SELECT dataset_masked_view_name(:d)"), {"d": world["dataset"].id}
+        ).scalar()
+        act_as(conn, world["partner"], app_role=False)  # table owner: may query the view
+        conn.execute(text("SELECT set_config('consentledger.current_purpose', 'analytics', true)"))
+        row = conn.execute(text(f"SELECT * FROM {view} ORDER BY row_id LIMIT 1")).mappings().one()
+        assert row["income"] == "1234.5" and row["full_name"] == "[REDACTED]"
+        assert row["region"] == "[MASKED]"
+        conn.execute(text("SELECT set_config('consentledger.current_purpose', 'other', true)"))
+        assert conn.execute(text(f"SELECT count(*) FROM {view}")).scalar() == 0
+        plan = "\n".join(conn.execute(text(f"EXPLAIN SELECT * FROM {view}")).scalars())
+        assert "InitPlan" in plan  # permission checks run once per query
+
+    def test_policies_evaluate_helpers_once(self, conn: Connection, world: dict) -> None:
+        act_as(conn, world["owner"])
+        plan = "\n".join(conn.execute(text("EXPLAIN SELECT * FROM dataset_fields")).scalars())
+        assert "InitPlan" in plan
+
+    def test_field_without_column_reads_as_null(
+        self, db: Session, conn: Connection, world: dict
+    ) -> None:
+        publish_with_rows(conn, world, ROWS)
+        db.add(
+            DatasetField(
+                dataset_id=world["dataset"].id, name="late", data_type=DataType.TEXT, ordinal=9
+            )
+        )
+        db.flush()
+        act_as(conn, world["owner"])
+        rows = conn.execute(text("SELECT access_dataset(:d)"), {"d": world["dataset"].id})
+        assert rows.scalars().first()["late"] is None
+
+    def test_request_access_returns_id(self, conn: Connection, world: dict) -> None:
+        rid = conn.execute(
+            text("CALL request_access(:u, :d, CAST(:f AS uuid[]), 'research', :e, NULL)"),
+            {
+                "u": world["partner"].id,
+                "d": world["dataset"].id,
+                "f": [str(world["fields"]["income"].id)],
+                "e": utcnow() + timedelta(days=5),
+            },
+        ).scalar_one()
+        assert (
+            conn.execute(
+                text("SELECT purpose FROM access_requests WHERE request_id = :r"), {"r": rid}
+            ).scalar()
+            == "research"
+        )
+
+    def test_verify_chain_summary(self, db: Session, conn: Connection, world: dict) -> None:
+        logs = [AuditLog(user_id=world["partner"].id, action=AuditAction.LOGIN) for _ in range(3)]
+        db.add_all(logs)
+        db.flush()
+        ok = conn.execute(text("SELECT * FROM verify_chain_summary()")).one()
+        assert ok.is_valid and ok.total_rows == ok.verified_rows and ok.first_bad_log_id is None
+        conn.execute(text("ALTER TABLE audit_log DISABLE TRIGGER trg_audit_log_immutable"))
+        conn.execute(
+            text("UPDATE audit_log SET rows_affected = 9 WHERE log_id = :i"), {"i": logs[1].id}
+        )
+        bad = conn.execute(text("SELECT * FROM verify_chain_summary()")).one()
+        assert not bad.is_valid and bad.first_bad_log_id == logs[1].id
+        assert bad.verified_rows == bad.total_rows - 2  # stopped at the modified row
+        assert conn.execute(text("SELECT is_audit_chain_valid()")).scalar() is False
+
+    def test_admin_sees_alerts(self, db: Session, conn: Connection, world: dict) -> None:
+        admin = make_user(db, world["auditor_org"], UserRole.ADMIN)
+        db.add(AnomalyAlert(user_id=world["partner"].id, score=0.9, reason="test"))
+        db.flush()
+        act_as(conn, admin)
+        assert conn.execute(text("SELECT count(*) FROM anomaly_alerts")).scalar() >= 1
+        title = conn.execute(
+            text("SELECT title FROM datasets WHERE dataset_id = :d"), {"d": world["dataset"].id}
+        ).scalar()
+        assert title == "Beneficiaries"  # metadata, for reading alerts
+        assert conn.execute(text("SELECT count(*) FROM consent_grants")).scalar() == 0
+        reset(conn)
+        act_as(conn, world["partner"])
+        assert conn.execute(text("SELECT count(*) FROM anomaly_alerts")).scalar() == 0
+
+
 class TestFeaturesAndOps:
     def test_window_feature_views(self, db: Session, conn: Connection, world: dict) -> None:
         base = utcnow().replace(hour=10, minute=0, second=0, microsecond=0) - timedelta(days=1)

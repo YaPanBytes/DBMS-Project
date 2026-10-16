@@ -41,6 +41,9 @@ class Settings(BaseSettings):
 
     # Local email/password login (bcrypt) for demo accounts
     allow_password_login: bool = Field(True, alias="ALLOW_PASSWORD_LOGIN")
+    # Failed password logins allowed per email and client address in the window
+    login_max_failures: int = Field(5, alias="LOGIN_MAX_FAILURES", ge=1)
+    login_failure_window_seconds: int = Field(900, alias="LOGIN_FAILURE_WINDOW_SECONDS", ge=1)
 
     # Frontend / CORS
     frontend_url: str = Field("http://localhost:5173", alias="FRONTEND_URL")

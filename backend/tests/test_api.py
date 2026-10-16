@@ -360,6 +360,145 @@ class TestConsentEnforcement:
         assert rows[0]["email"] == "asha@example.org"  # decrypted for the owner
 
 
+class TestHardening:
+    def test_repeated_failed_logins_are_throttled(self, app):
+        from backend.app import ratelimit
+
+        ratelimit.reset()
+        limit = get_settings().login_max_failures
+        c = client(app)
+        bad = {"email": "admin@consentledger.org", "password": "wrong"}
+        for _ in range(limit):
+            assert c.post("/api/auth/login", json=bad).status_code == 401
+        r = c.post("/api/auth/login", json=bad)
+        assert r.status_code == 429 and int(r.headers["Retry-After"]) > 0
+        # throttled even with the right password, and on the token endpoint
+        good = {"email": "admin@consentledger.org", "password": PASSWORD}
+        assert c.post("/api/auth/login", json=good).status_code == 429
+        r = c.post(
+            "/api/auth/token", data={"username": "admin@consentledger.org", "password": PASSWORD}
+        )
+        assert r.status_code == 429
+        # other accounts are unaffected
+        assert (
+            c.post("/api/auth/login", json={**good, "email": "owner@hope.org"}).status_code == 200
+        )
+        ratelimit.reset()
+        assert c.post("/api/auth/login", json=good).status_code == 200
+
+    def test_google_network_failure_is_a_clean_error(self, app, monkeypatch):
+        from google.auth import exceptions as google_exceptions
+        from google.oauth2 import id_token
+
+        def boom(*a, **k):
+            raise google_exceptions.TransportError("no network")
+
+        monkeypatch.setattr(id_token, "verify_oauth2_token", boom)
+        with pytest.raises(google_oauth.GoogleAuthError, match="reach Google"):
+            google_oauth.verify_id_token("x")
+
+    def test_create_request_returns_the_new_request(self, app):
+        partner, owner = login(app, "partner@educare.org"), login(app, "owner@hope.org")
+        ds = dataset_id(owner, "Nutrition Program Outcomes")
+        field = owner.get(f"/api/datasets/{ds}").json()["fields"][0]["field_id"]
+        bodies = [
+            {"dataset_id": ds, "purpose": p, "field_ids": [field], "expires_at": future(9)}
+            for p in ("first purpose", "second purpose")
+        ]
+        made = [partner.post("/api/requests", json=b).json() for b in bodies]
+        assert [m["purpose"] for m in made] == ["first purpose", "second purpose"]
+        assert made[0]["request_id"] != made[1]["request_id"]
+
+    def test_verify_reports_totals(self, app):
+        r = login(app, "auditor@transparency.org").get("/api/audit/verify").json()
+        assert r["valid"] and r["total_rows"] == r["verified_rows"] > 0
+        assert r["first_error"] is None
+
+    def test_alerts_admin_can_view_but_not_triage(self, app):
+        auditor, admin = login(app, "auditor@transparency.org"), login(
+            app, "admin@consentledger.org"
+        )
+        auditor.post("/api/alerts/run-detector")
+        items = admin.get("/api/alerts").json()["items"]
+        assert items, "admins see alerts"
+        r = admin.patch(f"/api/alerts/{items[0]['alert_id']}", json={"status": "resolved"})
+        assert r.status_code == 403
+
+    def test_no_grants_on_draft_datasets(self, app):
+        c = login(app, "owner@educare.org")
+        ds = c.post("/api/datasets", json={"title": "Draft only"}).json()["dataset_id"]
+        f = c.post(f"/api/datasets/{ds}/fields", json={"name": "x", "data_type": "text"}).json()
+        org = c.get("/api/organizations", params={"q": "Global"}).json()["items"][0]["org_id"]
+        r = c.post(
+            "/api/consents",
+            json={
+                "dataset_id": ds,
+                "grantee_org_id": org,
+                "field_ids": [f["field_id"]],
+                "purpose": "research",
+                "expires_at": future(),
+            },
+        )
+        assert r.status_code == 400 and "Publish" in r.json()["error"]["message"]
+
+    def test_field_added_after_publish_can_be_loaded_and_shared(self, app):
+        c = login(app, "owner@educare.org")
+        ds = c.post("/api/datasets", json={"title": "Grows later"}).json()["dataset_id"]
+        c.post(f"/api/datasets/{ds}/fields", json={"name": "a", "data_type": "text"})
+        c.post(f"/api/datasets/{ds}/publish")
+        r = c.post(
+            f"/api/datasets/{ds}/fields",
+            json={"name": "b", "data_type": "integer", "sensitivity": "high"},
+        )
+        assert r.status_code == 201
+        csv = b"a,b\nx,1\ny,2\n"
+        r = c.post(f"/api/datasets/{ds}/rows", files={"file": ("d.csv", csv, "text/csv")})
+        assert r.status_code == 200 and r.json()["rows_loaded"] == 2
+        rows = c.get(f"/api/datasets/{ds}/data").json()["rows"]
+        assert [(x["a"], x["b"]) for x in rows] == [("x", "1"), ("y", "2")]
+
+    def test_bulk_revoke(self, app):
+        owner, funder = login(app, "owner@hope.org"), login(app, "funder@globalfund.org")
+        ds = dataset_id(owner, "Nutrition Program Outcomes")
+        fields = [f["field_id"] for f in owner.get(f"/api/datasets/{ds}").json()["fields"][:2]]
+        org = funder.get("/api/auth/me").json()["organization"]["org_id"]
+        made = owner.post(
+            "/api/consents",
+            json={
+                "dataset_id": ds,
+                "grantee_org_id": org,
+                "field_ids": fields,
+                "purpose": "bulk test",
+                "expires_at": future(),
+            },
+        ).json()
+        assert [g["field_id"] for g in made] == fields
+        ids = [g["grant_id"] for g in made]
+        assert (
+            funder.get(f"/api/datasets/{ds}/data", params={"purpose": "bulk test"}).status_code
+            == 200
+        )
+        r = owner.post("/api/consents/revoke", json={"grant_ids": ids, "reason": "done"})
+        assert r.status_code == 200 and r.json() == {"revoked": 2}
+        assert (
+            funder.get(f"/api/datasets/{ds}/data", params={"purpose": "bulk test"}).status_code
+            == 403
+        )
+        # repeat is a no-op; someone else's ids are 404
+        assert owner.post("/api/consents/revoke", json={"grant_ids": ids}).json() == {"revoked": 0}
+        other = login(app, "owner@educare.org")
+        assert other.post("/api/consents/revoke", json={"grant_ids": ids}).status_code == 404
+
+    def test_oversized_upload_rejected(self, app):
+        from backend.app.csv_utils import MAX_UPLOAD_BYTES
+
+        c = login(app, "owner@educare.org")
+        ds = c.post("/api/datasets", json={"title": "Too big"}).json()["dataset_id"]
+        big = b"a\n" + b"x\n" * (MAX_UPLOAD_BYTES // 2 + 10)
+        r = c.post(f"/api/datasets/{ds}/upload/preview", files={"file": ("b.csv", big, "text/csv")})
+        assert r.status_code == 413
+
+
 # ============================================================================
 # VALIDATION, ERRORS, PAGINATION
 # ============================================================================

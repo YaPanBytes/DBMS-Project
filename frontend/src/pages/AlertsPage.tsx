@@ -16,6 +16,7 @@ export default function AlertsPage() {
   const page = Number(params.get("page") ?? 1);
   const [revoking, setRevoking] = useState<Alert | null>(null);
   const action = useAction();
+  const canTriage = hasRole("owner", "auditor"); // admins run the detector; they don't triage
   const set = (k: string, v: string) => {
     const next = new URLSearchParams(params);
     if (v) next.set(k, v); else next.delete(k);
@@ -81,7 +82,7 @@ export default function AlertsPage() {
                 <div className="alert-card-body">
                   <div className="request-head">
                     <p><strong>{a.user_email}</strong> <span className="muted">({a.user_org_name})</span> on{" "}
-                      {a.dataset_id ? <Link to={`/datasets/${a.dataset_id}`}>{a.dataset_title}</Link> : "a dataset"}</p>
+                      {!a.dataset_id ? "a dataset" : canTriage ? <Link to={`/datasets/${a.dataset_id}`}>{a.dataset_title}</Link> : a.dataset_title}</p>
                     <StatusBadge status={a.status} />
                   </div>
                   <p className="alert-reason">{a.reason}</p>
@@ -89,9 +90,9 @@ export default function AlertsPage() {
                     {DETECTOR[a.detector]}
                     {a.features?.also_flagged_by_rule ? " and the threshold rule" : ""}, hour starting{" "}
                     {a.features?.hour_bucket ? fmtDateTime(String(a.features.hour_bucket) + "Z") : fmtDateTime(a.created_at)} UTC.{" "}
-                    {a.active_grants > 0 ? `${a.active_grants} active grants on this dataset.` : "No active grants on this dataset."}
+                    {canTriage && (a.active_grants > 0 ? `${a.active_grants} active grants on this dataset.` : "No active grants on this dataset.")}
                   </p>
-                  {(a.status === "open" || a.status === "investigating") && (
+                  {(a.status === "open" || a.status === "investigating") && canTriage && (
                     <div className="request-actions">
                       {hasRole("owner") && a.active_grants > 0 && (
                         <button type="button" className="btn btn-danger btn-small" onClick={() => setRevoking(a)}>Revoke their access</button>

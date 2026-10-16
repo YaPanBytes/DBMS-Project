@@ -7,11 +7,20 @@ from fastapi import APIRouter, Query
 from sqlalchemy import func, or_, select, text
 from sqlalchemy.orm import Session, aliased
 
-from database.models import ConsentGrant, Dataset, DatasetField, Organization
+from database.models import ConsentGrant, Dataset, DatasetField, DatasetStatus, Organization
 
 from ..deps import AuthUser, DbSession, OwnerUser, Paging
 from ..errors import AppError
-from ..schemas import ConsentCreate, ConsentOut, ExtendIn, Page, RevokeIn, make_page
+from ..schemas import (
+    BulkRevokeIn,
+    BulkRevokeOut,
+    ConsentCreate,
+    ConsentOut,
+    ExtendIn,
+    Page,
+    RevokeIn,
+    make_page,
+)
 from ..services import count, grant_status
 
 router = APIRouter(prefix="/consents", tags=["consent"])
@@ -125,6 +134,8 @@ def create_consents(body: ConsentCreate, db: DbSession, current: OwnerUser) -> l
     ds = db.get(Dataset, body.dataset_id)
     if ds is None or ds.owner_org_id != current.org_id:
         raise AppError(404, "Dataset not found among your organization's datasets")
+    if ds.status != DatasetStatus.PUBLISHED:
+        raise AppError(400, "Publish the dataset before granting access to it")
     if body.grantee_org_id == current.org_id:
         raise AppError(400, "You cannot grant consent to your own organization")
     if db.get(Organization, body.grantee_org_id) is None:
@@ -152,7 +163,35 @@ def create_consents(body: ConsentCreate, db: DbSession, current: OwnerUser) -> l
     ]
     db.add_all(grants)  # grants and their audit entries commit together
     db.commit()
-    return [_one(db, g.grant_id) for g in grants]
+    ids = [g.grant_id for g in grants]
+    rows = db.execute(_base().where(ConsentGrant.grant_id.in_(ids))).all()
+    by_id = {r[0].grant_id: _out(r) for r in rows}
+    return [by_id[i] for i in ids]
+
+
+@router.post(
+    "/revoke",
+    response_model=BulkRevokeOut,
+    summary="Revoke several grants at once (all or nothing; already revoked ones are skipped)",
+)
+def revoke_many(body: BulkRevokeIn, db: DbSession, current: OwnerUser) -> BulkRevokeOut:
+    ids = list(dict.fromkeys(body.grant_ids))
+    found = dict(
+        db.execute(
+            select(ConsentGrant.grant_id, ConsentGrant.revoked_at).where(
+                ConsentGrant.grant_id.in_(ids), ConsentGrant.grantor_org_id == current.org_id
+            )
+        ).all()
+    )
+    if missing := [str(i) for i in ids if i not in found]:
+        raise AppError(404, "Some consent grants were not found", details=missing)
+    active = [i for i in ids if found[i] is None]  # already revoked ones are skipped
+    for gid in active:
+        db.execute(
+            text("CALL revoke_grant(:u, :g, :r)"), {"u": current.id, "g": gid, "r": body.reason}
+        )
+    db.commit()
+    return BulkRevokeOut(revoked=len(active))
 
 
 @router.get("/{grant_id}", response_model=ConsentOut)
