@@ -78,6 +78,12 @@ def create_app() -> FastAPI:
     for r in (auth, organizations, datasets, consent, requests, audit, alerts, dashboard):
         app.include_router(r.router, prefix=API_PREFIX)
 
+    # Plain landing response for the bare host (e.g. a hosting platform's URL
+    # check). Kept out of the OpenAPI spec; the API itself lives under /api.
+    @app.get("/", include_in_schema=False)
+    def root() -> dict:
+        return {"service": "consentledger-api", "status": "ok", "docs": "/docs"}
+
     @app.get(f"{API_PREFIX}/health", tags=["dashboard"], summary="Liveness and database check")
     def health() -> dict:
         with get_engine().connect() as conn:

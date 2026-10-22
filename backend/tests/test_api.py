@@ -533,6 +533,11 @@ class TestApiConventions:
         found = c.get("/api/datasets", params={"q": "vaccination"}).json()["items"]
         assert [d["title"] for d in found] == ["Vaccination Coverage Survey"]
 
+    def test_root_answers_without_auth(self, app):
+        r = client(app).get("/")
+        assert r.status_code == 200
+        assert r.json() == {"service": "consentledger-api", "status": "ok", "docs": "/docs"}
+
     def test_unknown_dataset_is_404(self, app):
         r = login(app, "owner@hope.org").get(f"/api/datasets/{uuid4()}")
         assert r.status_code == 404 and r.json()["error"]["code"] == "not_found"
