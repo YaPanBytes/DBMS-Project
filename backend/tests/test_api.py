@@ -537,6 +537,7 @@ class TestApiConventions:
         r = client(app).get("/")
         assert r.status_code == 200
         assert r.json() == {"service": "consentledger-api", "status": "ok", "docs": "/docs"}
+        assert client(app).head("/").status_code == 200  # platform health probes
 
     def test_unknown_dataset_is_404(self, app):
         r = login(app, "owner@hope.org").get(f"/api/datasets/{uuid4()}")

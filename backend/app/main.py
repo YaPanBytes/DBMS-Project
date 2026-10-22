@@ -80,7 +80,8 @@ def create_app() -> FastAPI:
 
     # Plain landing response for the bare host (e.g. a hosting platform's URL
     # check). Kept out of the OpenAPI spec; the API itself lives under /api.
-    @app.get("/", include_in_schema=False)
+    # GET and HEAD: hosting platforms probe the root with HEAD requests.
+    @app.api_route("/", methods=["GET", "HEAD"], include_in_schema=False)
     def root() -> dict:
         return {"service": "consentledger-api", "status": "ok", "docs": "/docs"}
 
