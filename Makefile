@@ -108,4 +108,3 @@ clean:
 setup: db-up migrate seed
 	@echo ""
 	@echo "ConsentLedger is ready. Run 'make api' and 'make web', then open http://localhost:5173"
-python -m database.migrate
