@@ -7,6 +7,8 @@ in a hash-chained, append-only audit log; an AI layer flags unusual access and
 detects personal data before anything is shared. Supports SDG 17 (partnerships
 for the goals).
 
+Course: BCSE302P Database Systems Lab (DBTHON, SDG 17).
+
 | Layer | What's in it |
 |---|---|
 | `database/` | Schema (Alembic + SQL), RLS, masked views, audit chain, procedures, ORM models, seed data, backup/restore, tests |
@@ -54,6 +56,9 @@ cd frontend && npm install && npm run dev  # web app on http://localhost:5173
 Or run everything in containers: `docker compose --profile app up -d --build`
 (web app on http://localhost:8080). With `make`, see `make help`.
 
+On Windows, use `py -m pip install -r requirements.txt` and `py -m ...` in place
+of `pip` and `python -m ...` if `python` is not on your PATH.
+
 ### Demo accounts (password `demo123`)
 
 | Account | Role |
@@ -79,6 +84,40 @@ organizations*); a person signs in with the Google account matching their
 registered email. Without these settings the Google button is hidden and
 password login is used.
 
+## Backend (FastAPI)
+
+The backend lives in `backend/app/` and is the only way users reach the
+database. It authenticates the user, sets the per-request session variables
+(user and organization) that the RLS policies read, validates input with
+Pydantic, and calls into PostgreSQL, which makes the final consent decision.
+
+- **Auth:** Google OAuth 2.0 and password login, both issuing a JWT; `/me`
+  returns the signed-in user; logout revokes the token server-side.
+- **RBAC:** roles (owner, partner, auditor, admin) come from the single users
+  table and roles lookup table, enforced through the `require_roles` dependency.
+- **Routers:** auth, organizations, datasets, consent, requests, audit, alerts,
+  dashboard, with search, filter and pagination on list endpoints.
+- **CSV handling:** `backend/app/csv_utils.py` normalises column names and
+  parses uploaded CSV files into the original headers, the normalised column
+  names and the rows.
+- **Errors:** every error is returned as `{"error": {"code", "message", "details"?}}`.
+- **API reference:** run the server and open `http://localhost:8000/docs`, or
+  see the exported OpenAPI files in `docs/api/`.
+
+### Backend contribution (Surjadeep)
+
+Contribution by Surjadeep ([@surjadeep337](https://github.com/surjadeep337)),
+backend lead. His commits were made on the `backend-surjadeep` branch and are
+merged into `yas`; the branch tip is also kept as the tag
+`archive/backend-surjadeep`.
+
+| Change | File(s) | Why |
+|---|---|---|
+| Added docstrings to backend modules | `backend/` | Document what each router and helper does |
+| Fixed an invalid `//` comment (a Python syntax error caught by ruff) | `backend/app/csv_utils.py` | CI's `ruff check` failed on it |
+| Reformatted with ruff so the format check passes | `backend/app/csv_utils.py` | CI's `ruff format --check` failed |
+| Wrote this README section | `README.md` | Explain the backend and how to run and test it |
+
 ## Security model
 
 - **Database:** RLS + a non-owner application role; masked views; purpose-bound
@@ -91,7 +130,8 @@ password login is used.
   are throttled (429 with `Retry-After`); Pydantic validation; every
   error is `{"error": {"code", "message", "details"?}}`.
 - **Secrets** only in `.env` (database password, JWT secret, encryption key,
-  OAuth client secret). Production refuses to start with development secrets.
+  OAuth client secret). Commit `.env.example` only; `.env` stays in `.gitignore`.
+  Production refuses to start with development secrets.
 
 ## Tests and CI
 
@@ -100,18 +140,41 @@ python -m pytest                     # database, API and AI tests (creates and d
 cd frontend && npm run lint && npm run build
 ```
 
-The suite (109 tests) creates a throwaway `<db>_test` database, migrates and seeds
-it, and covers schema constraints, the audit chain and tamper detection,
-procedures, RLS and the masked read path (including that permission checks run
-once per query), encryption, window features, a
-`pg_dump`/`pg_restore` round trip, authentication (cookies, CSRF, bearer, logout,
-Google), RBAC, consent enforcement over HTTP, and the AI modules.
+The suite creates a throwaway `<db>_test` database, migrates and seeds it, and
+covers schema constraints, the audit chain and tamper detection, procedures, RLS
+and the masked read path (including that permission checks run once per query),
+encryption, window features, a `pg_dump`/`pg_restore` round trip, authentication
+(cookies, CSRF, bearer, logout, Google, login throttling), RBAC, consent
+enforcement over HTTP, and the AI modules.
 
-GitHub Actions (`.github/workflows/ci.yml`) runs on every pull request to `dev`:
-install, lint (ruff, black, ESLint, tsc), migrations up/down/up, tests with
-coverage, OpenAPI drift check, frontend build and Docker image builds.
-`pages.yml` publishes the API reference in `docs/api/` to GitHub Pages
-(regenerate with `python scripts/export_openapi.py`).
+GitHub Actions (`.github/workflows/ci.yml`) runs on every push: install, lint
+(`ruff check` and `black --check` on `database backend ai conftest.py scripts`,
+plus ESLint and tsc), migrations up/down/up, tests with coverage, OpenAPI drift
+check, frontend build and Docker image builds. If you change the API, regenerate
+the reference in `docs/api/` with `python scripts/export_openapi.py`.
+
+Run the same lint checks locally before pushing:
+
+```bash
+python -m ruff check database backend ai conftest.py scripts
+python -m black --check database backend ai conftest.py scripts
+```
+
+Use the same ruff and black versions as CI, or the checks can disagree with CI.
+
+## Git workflow
+
+- `yas` is the default and only long-lived branch; work on a short-lived
+  feature branch, open a pull request into `yas`, and delete the branch after
+  merging.
+- Never commit `.env` or any secret.
+
+```bash
+git checkout -b <your-branch>
+git add <files>
+git commit -m "Short, meaningful message"
+git push -u origin <your-branch>
+```
 
 ## Useful commands
 
