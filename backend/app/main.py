@@ -6,14 +6,17 @@ Docs: http://localhost:8000/docs  (OpenAPI JSON at /openapi.json)
 
 import logging
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy import text
 
 from .config import get_settings
 from .db import get_engine
-from .errors import install_exception_handlers
+from .errors import AppError, install_exception_handlers
 from .routers import alerts, audit, auth, consent, dashboard, datasets, organizations, requests
 
 API_PREFIX = "/api"
@@ -80,10 +83,6 @@ def create_app() -> FastAPI:
 
     # Plain landing response for the bare host (e.g. a hosting platform's URL
     # check). Kept out of the OpenAPI spec; the API itself lives under /api.
-    # GET and HEAD: hosting platforms probe the root with HEAD requests.
-    @app.api_route("/", methods=["GET", "HEAD"], include_in_schema=False)
-    def root() -> dict:
-        return {"service": "consentledger-api", "status": "ok", "docs": "/docs"}
 
     @app.get(f"{API_PREFIX}/health", tags=["dashboard"], summary="Liveness and database check")
     def health() -> dict:
@@ -92,7 +91,37 @@ def create_app() -> FastAPI:
             rev = conn.execute(text("SELECT version_num FROM alembic_version")).scalar()
         return {"status": "ok", "database": "ok", "migration": rev}
 
+    dist = Path(settings.frontend_dist) if settings.frontend_dist else None
+    if dist is not None and (dist / "index.html").is_file():
+        _serve_frontend(app, dist)
+    else:
+        # API only. GET and HEAD: hosting platforms probe the root with HEAD.
+        @app.api_route("/", methods=["GET", "HEAD"], include_in_schema=False)
+        def root() -> dict:
+            return {"service": "consentledger-api", "status": "ok", "docs": "/docs"}
+
     return app
+
+
+def _serve_frontend(app: FastAPI, dist: Path) -> None:
+    """Serve the built single-page app: hashed assets from /assets, real files
+    (favicon, ...) as they are, and index.html for every other path so the
+    app's own routes (/datasets/..., /audit) work on reload. Registered after
+    the API routes, so /api, /docs, /redoc and /openapi.json win."""
+    root = dist.resolve()
+    index = root / "index.html"
+    if (root / "assets").is_dir():
+        app.mount("/assets", StaticFiles(directory=root / "assets"), name="assets")
+
+    @app.api_route("/{path:path}", methods=["GET", "HEAD"], include_in_schema=False)
+    def spa(path: str) -> FileResponse:
+        if path == "api" or path.startswith("api/"):
+            raise AppError(404, "Not Found")  # unknown API paths stay JSON 404s
+        candidate = (root / path).resolve()
+        if path and candidate.is_file() and candidate.is_relative_to(root):
+            return FileResponse(candidate)
+        # Always revalidate the page so a new deploy is picked up at once
+        return FileResponse(index, headers={"Cache-Control": "no-cache"})
 
 
 app = create_app()

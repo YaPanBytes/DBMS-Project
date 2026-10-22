@@ -499,6 +499,46 @@ class TestHardening:
         assert r.status_code == 413
 
 
+class TestServesWebApp:
+    """With FRONTEND_DIST set (as in the Docker image) the API also serves the
+    built web app; API, docs and unknown /api paths keep working as before."""
+
+    @pytest.fixture
+    def web(self, tmp_path, monkeypatch):
+        (tmp_path / "assets").mkdir()
+        (tmp_path / "index.html").write_text("<!doctype html><title>ConsentLedger</title>")
+        (tmp_path / "assets" / "app-123.js").write_text("console.log(1)")
+        (tmp_path / "favicon.svg").write_text("<svg/>")
+        (tmp_path.parent / "secret.txt").write_text("no")
+        monkeypatch.setenv("FRONTEND_DIST", str(tmp_path))
+        get_settings.cache_clear()
+        yield TestClient(create_app())
+        monkeypatch.delenv("FRONTEND_DIST")
+        get_settings.cache_clear()
+
+    def test_pages_get_the_app(self, web):
+        for path in ("/", "/datasets/abc", "/audit"):
+            r = web.get(path)
+            assert r.status_code == 200 and "<title>ConsentLedger" in r.text, path
+            assert r.headers["cache-control"] == "no-cache"
+        assert web.head("/").status_code == 200
+
+    def test_files_are_served(self, web):
+        assert web.get("/assets/app-123.js").text == "console.log(1)"
+        assert web.get("/favicon.svg").text == "<svg/>"
+
+    def test_api_and_docs_unchanged(self, web):
+        assert web.get("/api/auth/config").json()["password_login_enabled"] in (True, False)
+        assert web.get("/docs").status_code == 200 and "swagger" in web.get("/docs").text.lower()
+        assert web.get("/openapi.json").json()["info"]["title"] == "ConsentLedger API"
+        r = web.get("/api/no-such-thing")
+        assert r.status_code == 404 and r.json()["error"]["code"] == "not_found"
+
+    def test_cannot_escape_the_folder(self, web):
+        for path in ("/../secret.txt", "/%2e%2e/secret.txt", "/assets/../../secret.txt"):
+            assert web.get(path).text != "no", path
+
+
 # ============================================================================
 # VALIDATION, ERRORS, PAGINATION
 # ============================================================================

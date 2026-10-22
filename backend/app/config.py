@@ -47,6 +47,9 @@ class Settings(BaseSettings):
 
     # Frontend / CORS
     frontend_url: str = Field("http://localhost:5173", alias="FRONTEND_URL")
+    # Directory with the built web app (frontend/dist). When set, the API also
+    # serves the web app, so one deployment hosts both. Empty: API only.
+    frontend_dist: str = Field("", alias="FRONTEND_DIST")
     cors_origins: str = Field("http://localhost:5173,http://localhost:3000", alias="CORS_ORIGINS")
 
     @field_validator("cookie_samesite")

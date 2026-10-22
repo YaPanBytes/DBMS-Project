@@ -1,6 +1,7 @@
 **/__pycache__
 **/node_modules
-frontend
+frontend/dist
+**/*.tsbuildinfo
 .git
 .venv
 backups

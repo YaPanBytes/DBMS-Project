@@ -56,6 +56,27 @@ cd frontend && npm install && npm run dev  # web app on http://localhost:5173
 Or run everything in containers: `docker compose --profile app up -d --build`
 (web app on http://localhost:8080). With `make`, see `make help`.
 
+### Deployment (Render)
+
+One Render web service runs the whole app from `backend/Dockerfile`: the image
+builds the React app and the API serves it, so the web app, `/api` and `/docs`
+share one address and sign-in cookies work without cross-site settings.
+
+| URL | What it is |
+|---|---|
+| `/` and app pages (`/datasets`, `/audit`, ...) | The web app |
+| `/api/...` | The REST API |
+| `/api/health` | Health check: API, database and migration version |
+| `/docs`, `/redoc` | Interactive API documentation |
+
+The container applies migrations on start. Set the secrets from `.env.example`
+on the service (`DATABASE_URL`, `JWT_SECRET`, `ENCRYPTION_KEY`; for Google
+sign-in also `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, and `FRONTEND_URL` /
+`GOOGLE_REDIRECT_URI` using the service's URL), and `COOKIE_SECURE=true` since
+Render serves HTTPS. Demo accounts exist only after seeding
+(`python -m database.seeds.seed_data`, from the service's shell). On the free
+plan the service sleeps when idle, so the first request can take up to a minute.
+
 On Windows, use `py -m pip install -r requirements.txt` and `py -m ...` in place
 of `pip` and `python -m ...` if `python` is not on your PATH.
 
