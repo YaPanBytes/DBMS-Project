@@ -76,3 +76,5 @@ ai/models/*.joblib
 tmp/
 temp/
 *.tmp
+# TypeScript incremental build cache
+*.tsbuildinfo

@@ -1,5 +1,5 @@
-"""Export the OpenAPI spec and a static Redoc page to docs/api/ (published by
-GitHub Pages; also available live at /docs and /redoc when the API runs).
+"""Export the OpenAPI spec and a static Redoc page to docs/api/ (CI checks the
+spec is up to date; the same docs are live at /docs and /redoc when the API runs).
 
     python scripts/export_openapi.py
 """

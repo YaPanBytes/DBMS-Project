@@ -1,0 +1,11 @@
+# Store text files with LF line endings and check them out with LF on every
+# OS, so Windows editors don't show whole files as changed.
+* text=auto eol=lf
+
+# Binary files: never convert
+*.png binary
+*.jpg binary
+*.ico binary
+*.joblib binary
+*.woff binary
+*.woff2 binary
