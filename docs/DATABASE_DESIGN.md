@@ -20,6 +20,7 @@ express (policies, plpgsql functions, triggers, procedures). Alembic applies it:
 | `0002` | `database/migrations/002_rls_views_audit.sql` | RLS, hash chain, audit triggers, masked views, read path, procedures, feature views, application role |
 | `0003` | `database/migrations/003_auth_tokens.sql` | `revoked_tokens` for logout |
 | `0004` | `database/migrations/004_performance_and_fixes.sql` | Faster policies and read path (same rules), salted AES-256 encryption, `verify_chain_summary()`, `request_access` returns the new id, admins can read alerts and dataset metadata |
+| `0005` | `database/migrations/005_app_role_membership.sql` | Lets the database login switch to `consentledger_app` on managed PostgreSQL, where the login is not a superuser |
 
 Each revision has a matching downgrade in `database/migrations/down/`. Commands:
 `alembic upgrade head` or `python -m database.migrate` (also `status`,
@@ -39,7 +40,10 @@ SET LOCAL ROLE consentledger_app;
 
 `true` makes the settings transaction-local (the bind-parameter equivalent of
 `SET LOCAL`). RLS is bypassed by superusers and table owners, so requests switch
-to `consentledger_app`, which owns nothing. The backend re-applies the context at
+to `consentledger_app`, which owns nothing. On managed PostgreSQL (Render and the
+like) the login is an ordinary user; migration 0005 grants it the right to
+switch to `consentledger_app` (`SET TRUE, INHERIT FALSE`), which PostgreSQL 16
+does not give a role's creator automatically. The backend re-applies the context at
 the start of every transaction a request opens (`backend/app/db.py`).
 
 Helpers: `current_user_id()`, `current_user_org_id()`, `current_user_role()`,
